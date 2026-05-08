@@ -253,28 +253,41 @@ class BaseChannel(ABC):
         del payload
         del existing_items
 
+    @staticmethod
+    def _content_block_type(block: Any) -> Any:
+        """JSON/dict parts (e.g. AgentLoop) use keys; runtime objects use attrs."""
+        if isinstance(block, dict):
+            return block.get("type")
+        return getattr(block, "type", None)
+
+    @staticmethod
+    def _content_text_value(block: Any) -> str:
+        if isinstance(block, dict):
+            return str(block.get("text") or "").strip()
+        return str(getattr(block, "text", None) or "").strip()
+
+    @staticmethod
+    def _content_refusal_value(block: Any) -> str:
+        if isinstance(block, dict):
+            return str(block.get("refusal") or "").strip()
+        return str(getattr(block, "refusal", None) or "").strip()
+
     def _content_has_text(self, contents: List[Any]) -> bool:
         """True if contents has at least one TEXT or REFUSAL with non-empty."""
         if not contents:
             return False
         for c in contents:
-            t = getattr(c, "type", None)
-            if (
-                t == ContentType.TEXT
-                and (getattr(c, "text", None) or "").strip()
-            ):
+            t = self._content_block_type(c)
+            if t == ContentType.TEXT and self._content_text_value(c):
                 return True
-            if (
-                t == ContentType.REFUSAL
-                and (getattr(c, "refusal", None) or "").strip()
-            ):
+            if t == ContentType.REFUSAL and self._content_refusal_value(c):
                 return True
         return False
 
     def _content_has_audio(self, contents: List[Any]) -> bool:
         """True if contents has at least one AUDIO block."""
         return any(
-            getattr(c, "type", None) == ContentType.AUDIO
+            self._content_block_type(c) == ContentType.AUDIO
             for c in (contents or [])
         )
 

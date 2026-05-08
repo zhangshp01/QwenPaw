@@ -1,0 +1,485 @@
+{
+  "info": {
+    "_postman_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "name": "QwenPaw AgentLoop (govdoc 协议兼容)",
+    "description": "QwenPaw `/api/agentloop` 接口集合，与 govdoc-agent AgentLoop 路径及 `{code,message,data}` 外壳对齐。\n\n使用前在 Collection Variables 中设置 `baseUrl`、`agentId`；若启用 Web 认证则填写 `authToken`（Bearer）。\n\n默认端口与 CLI 一致为 8088。",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8088"
+    },
+    {
+      "key": "agentId",
+      "value": "default"
+    },
+    {
+      "key": "authToken",
+      "value": ""
+    },
+    {
+      "key": "conversationId",
+      "value": ""
+    },
+    {
+      "key": "nodeId",
+      "value": ""
+    },
+    {
+      "key": "entryId",
+      "value": ""
+    },
+    {
+      "key": "templateId",
+      "value": ""
+    }
+  ],
+  "auth": { "type": "noauth" },
+  "item": [
+    {
+      "name": "Core",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Agent-Id",
+                "value": "{{agentId}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/agentloop/health"
+          }
+        },
+        {
+          "name": "Me",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Agent-Id",
+                "value": "{{agentId}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/agentloop/me"
+          }
+        },
+        {
+          "name": "Models",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Agent-Id",
+                "value": "{{agentId}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/agentloop/models"
+          }
+        },
+        {
+          "name": "Skills",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Agent-Id",
+                "value": "{{agentId}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/agentloop/skills"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Conversations",
+      "item": [
+        {
+          "name": "List conversations",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Agent-Id",
+                "value": "{{agentId}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/agentloop/conversations"
+          }
+        },
+        {
+          "name": "Create conversation",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Agent-Id",
+                "value": "{{agentId}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"title\": \"新对话\"\n}"
+            },
+            "url": "{{baseUrl}}/api/agentloop/conversations"
+          }
+        },
+        {
+          "name": "Get conversation",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Agent-Id",
+                "value": "{{agentId}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/agentloop/conversations/{{conversationId}}"
+          }
+        },
+        {
+          "name": "Update conversation (rename / pin)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "X-Agent-Id",
+                "value": "{{agentId}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"title\": \"重命名后的标题\",\n  \"pinned\": true\n}"
+            },
+            "url": "{{baseUrl}}/api/agentloop/conversations/{{conversationId}}"
+          }
+        },
+        {
+          "name": "Delete conversation",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "X-Agent-Id",
+                "value": "{{agentId}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/agentloop/conversations/{{conversationId}}"
+          }
+        },
+        {
+          "name": "Run conversation",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Agent-Id",
+                "value": "{{agentId}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"content\": \"你好，请用一句话介绍你自己。\",\n  \"model\": null,\n  \"skill\": null,\n  \"attachments\": [],\n  \"resume_from_waiting\": false,\n  \"selected_option\": null,\n  \"prompt_menu_input\": null\n}"
+            },
+            "url": "{{baseUrl}}/api/agentloop/conversations/{{conversationId}}/run"
+          }
+        },
+        {
+          "name": "Stream events (SSE)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Agent-Id",
+                "value": "{{agentId}}"
+              },
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              }
+            ],
+            "url": "{{baseUrl}}/api/agentloop/conversations/{{conversationId}}/events?run_id={{conversationId}}",
+            "description": "需在「Run conversation」返回后、任务仍在进行时请求；`run_id` 与当前实现中的 `conversationId` 一致。"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Workspace (占位 501)",
+      "item": [
+        {
+          "name": "List workspace",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "url": "{{baseUrl}}/api/agentloop/workspace?view=recent"
+          }
+        },
+        {
+          "name": "Tree",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "url": "{{baseUrl}}/api/agentloop/workspace/tree"
+          }
+        },
+        {
+          "name": "Create folder",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Agent-Id", "value": "{{agentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"文件夹\",\n  \"parent_id\": null\n}"
+            },
+            "url": "{{baseUrl}}/api/agentloop/workspace/folders"
+          }
+        },
+        {
+          "name": "Create document",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Agent-Id", "value": "{{agentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"未命名\",\n  \"parent_id\": null,\n  \"content_html\": \"<p></p>\",\n  \"content_text\": \"\",\n  \"source\": \"manual\"\n}"
+            },
+            "url": "{{baseUrl}}/api/agentloop/workspace/documents"
+          }
+        },
+        {
+          "name": "Get document",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "url": "{{baseUrl}}/api/agentloop/workspace/documents/{{nodeId}}"
+          }
+        },
+        {
+          "name": "Save document",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "X-Agent-Id", "value": "{{agentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"title\": \"标题\",\n  \"content_html\": \"<p>内容</p>\",\n  \"content_text\": \"内容\",\n  \"annotations\": []\n}"
+            },
+            "url": "{{baseUrl}}/api/agentloop/workspace/documents/{{nodeId}}"
+          }
+        },
+        {
+          "name": "Rename node",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "X-Agent-Id", "value": "{{agentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"新名称\"\n}" },
+            "url": "{{baseUrl}}/api/agentloop/workspace/nodes/{{nodeId}}"
+          }
+        },
+        {
+          "name": "Move node",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "X-Agent-Id", "value": "{{agentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"parent_id\": null\n}" },
+            "url": "{{baseUrl}}/api/agentloop/workspace/nodes/{{nodeId}}/move"
+          }
+        },
+        {
+          "name": "Delete node",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "url": "{{baseUrl}}/api/agentloop/workspace/nodes/{{nodeId}}"
+          }
+        },
+        {
+          "name": "Send to conversation",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "url": "{{baseUrl}}/api/agentloop/workspace/nodes/{{nodeId}}/send-to-conversation"
+          }
+        },
+        {
+          "name": "Download",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "url": "{{baseUrl}}/api/agentloop/workspace/download/{{nodeId}}"
+          }
+        },
+        {
+          "name": "Upload",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": []
+                }
+              ]
+            },
+            "url": "{{baseUrl}}/api/agentloop/workspace/uploads"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Settings",
+      "item": [
+        {
+          "name": "Get profile",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "url": "{{baseUrl}}/api/agentloop/settings/profile"
+          }
+        },
+        {
+          "name": "Update profile",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "X-Agent-Id", "value": "{{agentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"default_model\": null,\n  \"preferred_skills\": [],\n  \"recommendation_summary\": null\n}"
+            },
+            "url": "{{baseUrl}}/api/agentloop/settings/profile"
+          }
+        },
+        {
+          "name": "Get memory",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "url": "{{baseUrl}}/api/agentloop/settings/memory"
+          }
+        },
+        {
+          "name": "Update memory",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "X-Agent-Id", "value": "{{agentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"identity\": {},\n  \"memory\": {},\n  \"identify_markdown\": null,\n  \"memory_markdown\": null\n}"
+            },
+            "url": "{{baseUrl}}/api/agentloop/settings/memory"
+          }
+        },
+        {
+          "name": "Clear memory",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "url": "{{baseUrl}}/api/agentloop/settings/memory"
+          }
+        },
+        {
+          "name": "Get dictionaries",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "url": "{{baseUrl}}/api/agentloop/settings/dictionaries"
+          }
+        },
+        {
+          "name": "Create dictionary entry",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "X-Agent-Id", "value": "{{agentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"dict_type\": \"whiteList\",\n  \"word\": \"示例词\",\n  \"notes\": \"\"\n}"
+            },
+            "url": "{{baseUrl}}/api/agentloop/settings/dictionaries"
+          }
+        },
+        {
+          "name": "Delete dictionary entry",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "url": "{{baseUrl}}/api/agentloop/settings/dictionaries/{{entryId}}"
+          }
+        },
+        {
+          "name": "List templates",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "url": "{{baseUrl}}/api/agentloop/settings/templates"
+          }
+        },
+        {
+          "name": "Create template",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "title", "value": "模板标题", "type": "text" },
+                { "key": "document_type", "value": "", "type": "text" },
+                { "key": "file", "type": "file", "src": [] }
+              ]
+            },
+            "url": "{{baseUrl}}/api/agentloop/settings/templates"
+          }
+        },
+        {
+          "name": "Delete template",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
+            "url": "{{baseUrl}}/api/agentloop/settings/templates/{{templateId}}"
+          }
+        }
+      ]
+    }
+  ]
+}

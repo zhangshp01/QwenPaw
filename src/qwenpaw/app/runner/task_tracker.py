@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import weakref
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable, Coroutine
@@ -20,6 +21,10 @@ from typing import Any, AsyncGenerator, Callable, Coroutine
 logger = logging.getLogger(__name__)
 
 _SENTINEL = None
+
+# After a run finishes, keep SSE strings for late subscribers (e.g. AgentLoop
+# POST /run then GET /events). One attach consumes the replay.
+_DEFAULT_FINISHED_REPLAY_TTL_SEC = 120.0
 
 
 @dataclass
@@ -42,6 +47,8 @@ class TaskTracker:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._runs: dict[str, _RunState] = {}
+        # run_key -> (monotonic_expiry, buffer copy); expires after TTL
+        self._finished_replay: dict[str, tuple[float, list[str]]] = {}
 
     @property
     def lock(self) -> asyncio.Lock:
@@ -152,21 +159,45 @@ class TaskTracker:
                 state.task.set_result(None)
             logger.debug("Unregistered external task: %s", run_key)
 
+    def _prune_expired_replay_locked(self) -> None:
+        now = time.monotonic()
+        dead = [
+            k
+            for k, (exp_t, _) in self._finished_replay.items()
+            if exp_t <= now
+        ]
+        for k in dead:
+            del self._finished_replay[k]
+
     async def attach(self, run_key: str) -> asyncio.Queue | None:
         """Attach to an existing run.
 
         Returns a new queue pre-filled with the event buffer, or ``None``
-        if no run is active for *run_key*.
+        if no run is active for *run_key*. If the run already finished, a
+        short TTL replay of the buffered SSE may still be available (for
+        clients that connected after completion).
         """
         async with self._lock:
             state = self._runs.get(run_key)
-            if state is None or state.task.done():
+            if state is not None and not state.task.done():
+                q: asyncio.Queue = asyncio.Queue()
+                for sse in state.buffer:
+                    q.put_nowait(sse)
+                state.queues.append(q)
+                return q
+
+            self._prune_expired_replay_locked()
+            replay = self._finished_replay.pop(run_key, None)
+            if replay is None:
                 return None
-            q: asyncio.Queue = asyncio.Queue()
-            for sse in state.buffer:
-                q.put_nowait(sse)
-            state.queues.append(q)
-            return q
+            expires_at, buf = replay
+            if time.monotonic() > expires_at:
+                return None
+            q2: asyncio.Queue = asyncio.Queue()
+            for sse in buf:
+                q2.put_nowait(sse)
+            q2.put_nowait(_SENTINEL)
+            return q2
 
     async def detach_subscriber(
         self,
@@ -270,6 +301,13 @@ class TaskTracker:
                         async with tracker.lock:
                             for q in run.queues:
                                 q.put_nowait(_SENTINEL)
+                            replay_deadline = (
+                                time.monotonic() + _DEFAULT_FINISHED_REPLAY_TTL_SEC
+                            )
+                            tracker._finished_replay[run_key] = (
+                                replay_deadline,
+                                list(run.buffer),
+                            )
                             # pylint: disable=protected-access
                             tracker._runs.pop(
                                 run_key,
