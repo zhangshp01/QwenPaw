@@ -50,6 +50,7 @@ from .tools import (
     get_token_usage,
     glob_search,
     grep_search,
+    gov_document_writer,
     list_agents,
     read_file,
     send_file_to_user,
@@ -299,6 +300,23 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
                 "Registered tool: %s (async_execution=%s)",
                 tool_name,
                 async_exec,
+            )
+
+        # Govdoc / AgentLoop: models call kebab-case or Chinese tool names that
+        # must map to this implementation (see gov_document_writer module).
+        if enabled_tools.get("gov_document_writer", True):
+            toolkit.register_tool_function(
+                gov_document_writer,
+                namesake_strategy=namesake_strategy,
+                func_name="gov-document-writer",
+            )
+            toolkit.register_tool_function(
+                gov_document_writer,
+                namesake_strategy=namesake_strategy,
+                func_name="公文写作",
+            )
+            logger.debug(
+                "Registered gov document tools: gov-document-writer, 公文写作",
             )
 
         # Auto-register background task management tools if any *enabled*

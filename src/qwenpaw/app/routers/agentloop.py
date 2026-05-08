@@ -252,6 +252,265 @@ def _passthrough_console_sse_chunk(raw: str) -> str:
     return "".join(out_parts)
 
 
+def _slim_agentloop_sse_payload(obj: Any) -> Any:
+    """Drop nulls and empty noise fields from streamed AgentLoop JSON."""
+
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            if v is None:
+                continue
+            if k in {"metadata", "usage"} and v == {}:
+                continue
+            slim_v = _slim_agentloop_sse_payload(v)
+            if slim_v is None:
+                continue
+            if slim_v == {} and k in {"metadata", "usage"}:
+                continue
+            out[k] = slim_v
+        return out
+    if isinstance(obj, list):
+        return [_slim_agentloop_sse_payload(x) for x in obj]
+    return obj
+
+
+class _AgentLoopSseToolStreamDeduper:
+    """Collapse duplicate in-progress tool ``arguments`` / ``output`` fragments
+    (same ``msg_id`` + ``call_id``, identical payload until ``completed``).
+    """
+
+    def __init__(self) -> None:
+        self._last_args: dict[tuple[str, str], str] = {}
+        self._last_output: dict[tuple[str, str], str] = {}
+
+    def should_skip(self, payload: dict[str, Any]) -> bool:
+        if payload.get("object") != "content" or payload.get("type") != "data":
+            return False
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return False
+        msg_id = payload.get("msg_id")
+        call_id = data.get("call_id")
+        if not isinstance(msg_id, str) or not isinstance(call_id, str):
+            return False
+        key = (msg_id, call_id)
+        status = payload.get("status")
+
+        if "arguments" in data:
+            if status == "completed":
+                self._last_args.pop(key, None)
+                return False
+            raw = data.get("arguments", "")
+            cur = raw if isinstance(raw, str) else json.dumps(
+                raw,
+                ensure_ascii=False,
+            )
+            prev = self._last_args.get(key)
+            if prev == cur:
+                return True
+            self._last_args[key] = cur
+            return False
+
+        if "output" in data:
+            if status == "completed":
+                self._last_output.pop(key, None)
+                return False
+            raw = data.get("output", "")
+            cur = raw if isinstance(raw, str) else json.dumps(
+                raw,
+                ensure_ascii=False,
+            )
+            prev = self._last_output.get(key)
+            if prev == cur:
+                return True
+            self._last_output[key] = cur
+            return False
+
+        return False
+
+
+def _compact_should_drop_payload(d: dict[str, Any]) -> bool:
+    """Events that duplicate information the UI already gets elsewhere."""
+
+    if d.get("object") == "response" and d.get("status") == "in_progress":
+        return True
+    if (
+        d.get("object") == "content"
+        and d.get("status") == "completed"
+        and d.get("type") == "data"
+    ):
+        data = d.get("data")
+        if isinstance(data, dict) and (
+            "arguments" in data or "output" in data
+        ):
+            return True
+    return False
+
+
+def _reshape_compact_plugin_message(d: dict[str, Any]) -> dict[str, Any]:
+    """Replace nested ``content[]`` on tool messages with a flat ``tool`` dict."""
+
+    if (
+        d.get("object") != "message"
+        or d.get("status") != "completed"
+        or d.get("type") not in {"plugin_call", "plugin_call_output"}
+    ):
+        return d
+    raw_content = d.get("content")
+    if not isinstance(raw_content, list) or not raw_content:
+        return d
+    first = raw_content[0]
+    if not isinstance(first, dict):
+        return d
+    blob = first.get("data")
+    if not isinstance(blob, dict):
+        return d
+    out = {k: v for k, v in d.items() if k != "content"}
+    tool = {
+        k: blob[k]
+        for k in ("call_id", "name", "arguments", "output")
+        if k in blob
+    }
+    if tool:
+        out["tool"] = tool
+    return out
+
+
+class _AgentLoopSseTerminalDeduper:
+    """Suppress redundant ``content``/``message`` *completed* events when a
+    ``response`` *completed* follows (same final assistant text in three envelopes).
+    """
+
+    def __init__(self) -> None:
+        self._buf: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _is_text_content_done(d: Any) -> bool:
+        return (
+            isinstance(d, dict)
+            and d.get("object") == "content"
+            and d.get("status") == "completed"
+            and d.get("type") == "text"
+        )
+
+    @staticmethod
+    def _is_assistant_message_done(d: Any) -> bool:
+        return (
+            isinstance(d, dict)
+            and d.get("object") == "message"
+            and d.get("status") == "completed"
+            and d.get("type") == "message"
+            and d.get("role") == "assistant"
+        )
+
+    @staticmethod
+    def _is_response_done(d: Any) -> bool:
+        return (
+            isinstance(d, dict)
+            and d.get("object") == "response"
+            and d.get("status") == "completed"
+        )
+
+    def feed(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        if self._is_response_done(payload):
+            self._buf.clear()
+            return [payload]
+        if self._is_text_content_done(payload):
+            self._buf = [payload]
+            return []
+        if self._is_assistant_message_done(payload):
+            if (
+                len(self._buf) == 1
+                and self._is_text_content_done(self._buf[0])
+            ):
+                self._buf.append(payload)
+                return []
+            flushed = list(self._buf)
+            self._buf.clear()
+            return flushed + [payload]
+        flushed = list(self._buf)
+        self._buf.clear()
+        return flushed + [payload]
+
+    def flush(self) -> list[dict[str, Any]]:
+        out = list(self._buf)
+        self._buf.clear()
+        return out
+
+
+def _emit_agentloop_sse_dict(em: dict[str, Any], *, compact: bool) -> str:
+    if compact:
+        em = _reshape_compact_plugin_message(em)
+        slimmed = _slim_agentloop_sse_payload(em)
+        if not isinstance(slimmed, dict):
+            slimmed = em
+        if _AgentLoopSseTerminalDeduper._is_response_done(slimmed):
+            slimmed = {k: v for k, v in slimmed.items() if k != "output"}
+        payload: Any = slimmed
+    else:
+        payload = em
+    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+
+def _passthrough_agentloop_sse_chunk(
+    raw: str,
+    deduper: _AgentLoopSseTerminalDeduper,
+    tool_stream_deduper: _AgentLoopSseToolStreamDeduper,
+    *,
+    compact: bool = True,
+) -> str:
+    """Like :func:`_passthrough_console_sse_chunk` but:
+
+    - Drop duplicate terminal ``content``/``message`` completed lines before
+      ``response`` completed.
+    - Drop consecutive duplicate in-progress tool ``arguments`` / ``output``
+      fragments.
+    - In ``compact`` mode: drop ``response`` ``in_progress``, drop redundant
+      tool ``content`` ``completed`` lines (keep ``message`` completed with a
+      flat ``tool`` object), strip nulls, omit final ``response`` ``output``.
+    """
+    out_parts: list[str] = []
+    for block in raw.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+        if block == "data: [DONE]" or (
+            block.startswith("data:") and "[DONE]" in block
+        ):
+            for em in deduper.flush():
+                out_parts.append(_emit_agentloop_sse_dict(em, compact=compact))
+            out_parts.append("data: [DONE]\n\n")
+            continue
+        if not block.startswith("data:"):
+            continue
+        payload_str = block[5:].strip()
+        try:
+            inner: Any = json.loads(payload_str)
+        except json.JSONDecodeError:
+            inner = {"raw": payload_str}
+        if isinstance(inner, dict):
+            if compact and _compact_should_drop_payload(inner):
+                continue
+            if tool_stream_deduper.should_skip(inner):
+                continue
+            for em in deduper.feed(inner):
+                out_parts.append(_emit_agentloop_sse_dict(em, compact=compact))
+        else:
+            for em in deduper.flush():
+                out_parts.append(_emit_agentloop_sse_dict(em, compact=compact))
+            out_parts.append(
+                "data: "
+                + json.dumps(
+                    _slim_agentloop_sse_payload(inner)
+                    if compact
+                    else inner,
+                    ensure_ascii=False,
+                )
+                + "\n\n",
+            )
+    return "".join(out_parts)
+
+
 # ---------------------------------------------------------------------------
 # /api/agentloop/health, /me, /models, /skills
 # ---------------------------------------------------------------------------
@@ -544,6 +803,13 @@ async def stream_conversation_events(
     request: Request,
     conversation_id: str,
     run_id: str | None = Query(default=None),
+    compact: bool = Query(
+        default=True,
+        description="Frontend-friendly stream: drop response in_progress, merge "
+        "duplicate tool completed content lines, flatten plugin messages to a "
+        "top-level tool field, dedupe tool stream chunks, strip nulls, omit "
+        "final response output. Use compact=false for the raw verbose stream.",
+    ),
 ):
     workspace = await get_agent_for_request(request)
     mgr = workspace.chat_manager
@@ -558,12 +824,25 @@ async def stream_conversation_events(
     if queue is None:
         raise HTTPException(status_code=404, detail="暂无运行记录")
 
+    deduper = _AgentLoopSseTerminalDeduper()
+    tool_stream_deduper = _AgentLoopSseToolStreamDeduper()
+
     async def event_stream() -> AsyncGenerator[str, None]:
         stream_it = tracker.stream_from_queue(queue, chat.id)
         try:
             async for chunk in stream_it:
-                yield _passthrough_console_sse_chunk(chunk)
+                yield _passthrough_agentloop_sse_chunk(
+                    chunk,
+                    deduper,
+                    tool_stream_deduper,
+                    compact=compact,
+                )
         finally:
+            tail = deduper.flush()
+            if tail:
+                yield "".join(
+                    _emit_agentloop_sse_dict(em, compact=compact) for em in tail
+                )
             await stream_it.aclose()
 
     return StreamingResponse(

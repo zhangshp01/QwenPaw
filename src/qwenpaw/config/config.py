@@ -1386,6 +1386,15 @@ def _default_builtin_tools() -> Dict[str, BuiltinToolConfig]:
             description="Check the status of a background agent task",
             icon="⏳",
         ),
+        "gov_document_writer": BuiltinToolConfig(
+            name="gov_document_writer",
+            enabled=True,
+            description=(
+                "Formal / gov-style document draft (exposed as "
+                "gov-document-writer / 公文写作)"
+            ),
+            icon="📜",
+        ),
     }
 
 
