@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Formal / gov-style document helper for AgentLoop and govdoc-style tool names.
-
-The hosted model often emits tool calls named ``gov-document-writer`` or
-``公文写作``. Those names are registered in :class:`QwenPawAgent` via
-``func_name=...`` so execution resolves instead of ``FunctionNotFoundError``.
+"""Formal / gov-style document draft (``gov_document_writer``) and review
+(``doc_reviewer``) helpers for AgentLoop.
 """
 
 from __future__ import annotations
@@ -15,7 +12,9 @@ from typing import Any
 from agentscope.message import TextBlock
 from agentscope.tool import ToolResponse
 
-from .file_io import _resolve_file_path, write_file
+from ...config.context import get_current_recent_max_bytes
+from .file_io import _resolve_file_path, read_file, write_file
+from .utils import DEFAULT_MAX_BYTES, truncate_text_output
 
 
 def _content_block_text(block: Any) -> str | None:
@@ -30,6 +29,47 @@ def _safe_stem(name: str, max_len: int = 80) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*\n\r\t]', "_", name)
     cleaned = cleaned.strip(" .") or "document"
     return cleaned[:max_len]
+
+
+async def doc_reviewer(
+    content: str = "",
+    file_path: str = "",
+    path: str = "",
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> ToolResponse:
+    """Inline or file-based draft for review (校对、审阅、提修改建议).
+
+    Exposed to the model as ``doc_reviewer``. Pass ``content`` and/or
+    ``file_path`` / ``path`` (same resolution as :func:`read_file`).
+    """
+    body = (content or "").strip()
+    if body:
+        max_bytes = get_current_recent_max_bytes() or DEFAULT_MAX_BYTES
+        total_lines = body.count("\n") + (1 if body else 0)
+        text = truncate_text_output(
+            body,
+            start_line=1,
+            total_lines=total_lines,
+            max_bytes=max_bytes,
+            file_path="<inline-review>",
+        )
+        return ToolResponse(content=[TextBlock(type="text", text=text)])
+
+    target = (file_path or path or "").strip()
+    if not target:
+        return ToolResponse(
+            content=[
+                TextBlock(
+                    type="text",
+                    text=(
+                        "错误：缺少待审阅内容。请传入 content（正文），"
+                        "或 file_path / path（工作区文稿路径）。"
+                    ),
+                ),
+            ],
+        )
+    return await read_file(target, start_line=start_line, end_line=end_line)
 
 
 async def gov_document_writer(

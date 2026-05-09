@@ -1386,6 +1386,15 @@ def _default_builtin_tools() -> Dict[str, BuiltinToolConfig]:
             description="Check the status of a background agent task",
             icon="⏳",
         ),
+        "doc_reviewer": BuiltinToolConfig(
+            name="doc_reviewer",
+            enabled=True,
+            description=(
+                "Gov-style document review: inline ``content`` and/or workspace "
+                "``file_path`` / ``path``"
+            ),
+            icon="🔍",
+        ),
         "gov_document_writer": BuiltinToolConfig(
             name="gov_document_writer",
             enabled=True,
@@ -1419,10 +1428,11 @@ class ToolsConfig(BaseModel):
                 self.builtin_tools[name] = tc
             elif self.builtin_tools[name].icon is None:
                 self.builtin_tools[name].icon = tc.icon
-        # Normalise legacy/stale entries not in the current defaults
-        for name, tc in self.builtin_tools.items():
-            if name not in defaults and tc.icon is None:
-                tc.icon = ""
+        # Remove renamed/removed built-ins still present in saved YAML/JSON
+        # (e.g. ``gov_document_reviewer`` → ``doc_reviewer``).
+        for name in list(self.builtin_tools):
+            if name not in defaults:
+                del self.builtin_tools[name]
         return self
 
 

@@ -50,6 +50,7 @@ from .tools import (
     get_token_usage,
     glob_search,
     grep_search,
+    doc_reviewer,
     gov_document_writer,
     list_agents,
     read_file,
@@ -302,8 +303,13 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
                 async_exec,
             )
 
-        # Govdoc / AgentLoop: models call kebab-case or Chinese tool names that
-        # must map to this implementation (see gov_document_writer module).
+        # Govdoc / AgentLoop: document review exposes only ``doc_reviewer``.
+        if enabled_tools.get("doc_reviewer", True):
+            toolkit.register_tool_function(
+                doc_reviewer,
+                namesake_strategy=namesake_strategy,
+            )
+            logger.debug("Registered tool: doc_reviewer")
         if enabled_tools.get("gov_document_writer", True):
             toolkit.register_tool_function(
                 gov_document_writer,

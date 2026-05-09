@@ -28,6 +28,7 @@ _TOOL_FILE_PARAMS: dict[str, tuple[str, ...]] = {
     # agentscope built-ins (may be enabled by users)
     "view_text_file": ("file_path", "path"),
     "write_text_file": ("file_path", "path"),
+    "doc_reviewer": ("file_path", "path"),
 }
 
 _SECRET_DIR_CURRENT_NAME = ".qwenpaw.secret"

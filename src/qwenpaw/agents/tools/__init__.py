@@ -29,7 +29,7 @@ from .agent_management import (
     check_agent_task,
 )
 from .delegate_external_agent import delegate_external_agent
-from .gov_document_writer import gov_document_writer
+from .gov_document_writer import doc_reviewer, gov_document_writer
 
 __all__ = [
     "execute_python_code",
@@ -55,5 +55,6 @@ __all__ = [
     "chat_with_agent",
     "submit_to_agent",
     "check_agent_task",
+    "doc_reviewer",
     "gov_document_writer",
 ]
