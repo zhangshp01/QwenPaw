@@ -10,7 +10,18 @@ from qwenpaw.agents.tools.gov_document_writer import (
     doc_reviewer,
     gov_document_writer,
 )
-from qwenpaw.config.context import set_current_workspace_dir
+from qwenpaw.config.context import (
+    clear_agent_tool_step_for_running_task,
+    set_agent_tool_step_for_running_task,
+    set_current_workspace_dir,
+)
+
+
+def _json_payload(r):
+    block = r.content[0]
+    assert isinstance(block, dict)
+    assert block.get("type") == "json"
+    return block["json"]
 
 
 def test_doc_reviewer_requires_input():
@@ -54,9 +65,13 @@ def test_doc_reviewer_reads_file():
 def test_gov_document_writer_requires_content():
     async def _run():
         r = await gov_document_writer(content="")
-        text = _content_block_text(r.content[0])
-        assert text
-        assert "content" in text.lower()
+        p = _json_payload(r)
+        assert p["normalizedResult"] is None
+        assert p["sourceState"] == "error"
+        assert p["retryable"] is True
+        assert p["savePath"] is None
+        assert p["skillName"] == "gov-document-writer"
+        assert "content" in (p.get("errorDetail") or "").lower()
 
     asyncio.run(_run())
 
@@ -71,13 +86,41 @@ def test_gov_document_writer_writes_file():
                 content="Body line one.",
                 type="notice",
             )
-            text = _content_block_text(r.content[0])
-            assert text
-            assert "govdocs" in text
-            md = root / "govdocs" / "Holiday Notice.md"
-            assert md.is_file()
-            raw = md.read_text(encoding="utf-8")
-            assert "Holiday Notice" in raw
-            assert "Body line one." in raw
+            p = _json_payload(r)
+            assert p["skillName"] == "gov-document-writer"
+            assert p["sourceState"] == "model_success"
+            assert p["errorDetail"] is None
+            assert p["retryable"] is True
+            assert p["stepIndex"] == 1
+            sp = (p.get("savePath") or "").replace("\\", "/")
+            assert "govdocs" in sp
+            assert sp.lower().endswith(".docx")
+            nr = p["normalizedResult"]
+            assert nr["source"] == "model_success"
+            assert "Body line one." in nr["document"]
+            assert "**类型**" not in nr["document"]
+            assert "notice" not in nr["document"]
+            docx_files = list((root / "govdocs").glob("Holiday Notice-*.docx"))
+            assert len(docx_files) == 1
+            assert Path(p["savePath"]).resolve() == docx_files[0].resolve()
+            from docx import Document as DocxDocument
+
+            d = DocxDocument(str(docx_files[0]))
+            combined = "\n".join(para.text for para in d.paragraphs)
+            assert "Holiday Notice" in combined
+            assert "Body line one." in combined
+
+    asyncio.run(_run())
+
+
+def test_gov_document_writer_step_index_from_task_mapping():
+    async def _run():
+        set_agent_tool_step_for_running_task(3)
+        try:
+            r = await gov_document_writer(content="")
+            p = _json_payload(r)
+            assert p["stepIndex"] == 3
+        finally:
+            clear_agent_tool_step_for_running_task()
 
     asyncio.run(_run())

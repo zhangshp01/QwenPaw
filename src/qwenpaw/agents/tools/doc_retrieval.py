@@ -4,7 +4,7 @@
 Loads ``search`` from the ``doc-retrieval`` skill ``scripts/`` folder when
 present under workspace skills, working dir, or project ``doc-retrieval/``.
 
-Tool output is one content block ``{"type": "json", "json": {skillName, ...}}``
+Tool output is one content block ``{"type": "json", "json": {skillName, stepIndex, ...}}``
 (flat object, no extra ``payload`` wrapper).
 """
 
@@ -19,12 +19,14 @@ from typing import Any
 
 from agentscope.tool import ToolResponse
 
+from ...config.context import get_agent_tool_step_for_running_task
 from ...constant import WORKING_DIR
 
 _SKILL_NAME_EN = "doc-retrieval"
 _DISPLAY_TEXT_ZH = "已完成：知识库文档检索"
 _DISPLAY_TEXT_ERR_ZH = "知识库文档检索失败"
 _LEGACY_SOURCE_OK = "legacy_success"
+_FALLBACK_STEP_INDEX = 1
 _DESC_MAX_CHARS = 8000
 
 _search_module_cache: dict[str, Any] = {}
@@ -89,6 +91,12 @@ def _chunk_description(chunk: dict[str, Any]) -> str:
     return raw
 
 
+def _result_step_index() -> int:
+    """1-based index of this tool run in the current ``reply`` (see toolkit middleware)."""
+    step = get_agent_tool_step_for_running_task()
+    return int(step) if step is not None else _FALLBACK_STEP_INDEX
+
+
 def _result_body(
     *,
     ok: bool,
@@ -100,6 +108,7 @@ def _result_body(
         total = items_total if items_total is not None else len(items or [])
         return {
             "skillName": _SKILL_NAME_EN,
+            "stepIndex": _result_step_index(),
             "displayText": _DISPLAY_TEXT_ZH,
             "errorDetail": None,
             "normalizedResult": {
@@ -110,6 +119,7 @@ def _result_body(
         }
     return {
         "skillName": _SKILL_NAME_EN,
+        "stepIndex": _result_step_index(),
         "displayText": _DISPLAY_TEXT_ERR_ZH,
         "errorDetail": _one_line(error_detail or "unknown"),
         "normalizedResult": None,
@@ -159,9 +169,10 @@ async def doc_retrieval(
 ) -> ToolResponse:
     """Search the HaiRuo knowledge base (natural-language retrieval).
 
-    Returns ``[{"type": "json", "json": {skillName, displayText, ...}}]`` — the
-    ``json`` object holds ``skillName``, ``displayText``, ``errorDetail``, and
-    ``normalizedResult`` directly (no ``payload`` key).
+    Returns ``[{"type": "json", "json": {skillName, stepIndex, displayText, ...}}]`` — the
+    ``json`` object holds ``skillName``, ``stepIndex`` (1-based order of this tool execution
+    within the current agent ``reply``, across ReAct iterations), ``displayText``,
+    ``errorDetail``, and ``normalizedResult`` directly (no ``payload`` key).
     The ``output_format`` parameter is kept for schema stability only.
 
     Configuration is read from ``kb_defaults.json`` next to the skill scripts.

@@ -1399,8 +1399,8 @@ def _default_builtin_tools() -> Dict[str, BuiltinToolConfig]:
             name="gov_document_writer",
             enabled=True,
             description=(
-                "Formal / gov-style document draft (exposed as "
-                "gov-document-writer / 公文写作)"
+                "Formal / gov-style document draft; saves ``.docx`` under "
+                "``govdocs/{title}-{timestamp}.docx`` (gov-document-writer / 公文写作)"
             ),
             icon="📜",
         ),

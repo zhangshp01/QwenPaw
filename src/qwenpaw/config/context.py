@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
-"""Context variable for agent workspace directory.
+"""Runtime context for tools (workspace dir, limits, agent tool-step index).
 
-This module provides a context variable to pass the agent's workspace
-directory to tool functions, allowing them to resolve relative paths
-correctly in a multi-agent environment.
+Also tracks the current asyncio :class:`~asyncio.Task` tool-execution order
+(1-based within one ``QwenPawAgent.reply``), keyed by task so parallel tool
+calls do not overwrite each other.
 """
+from __future__ import annotations
+
+import asyncio
 from contextvars import ContextVar
 from pathlib import Path
+from weakref import WeakKeyDictionary
 
 # Context variable to store the current agent's workspace directory
 current_workspace_dir: ContextVar[Path | None] = ContextVar(
@@ -81,3 +85,34 @@ def set_current_shell_command_timeout(timeout: float | None) -> None:
         timeout: Timeout in seconds.
     """
     current_shell_command_timeout.set(timeout)
+
+
+# ---------------------------------------------------------------------------
+# Tool execution step (1-based index within one agent ``reply`` cycle)
+# ---------------------------------------------------------------------------
+
+_agent_tool_step_by_task: WeakKeyDictionary[asyncio.Task, int] = (
+    WeakKeyDictionary()
+)
+
+
+def set_agent_tool_step_for_running_task(step: int) -> None:
+    """Associate *step* with ``asyncio.current_task()`` for the running tool."""
+    task = asyncio.current_task()
+    if task is not None:
+        _agent_tool_step_by_task[task] = int(step)
+
+
+def clear_agent_tool_step_for_running_task() -> None:
+    """Remove the step mapping for ``asyncio.current_task()``."""
+    task = asyncio.current_task()
+    if task is not None:
+        _agent_tool_step_by_task.pop(task, None)
+
+
+def get_agent_tool_step_for_running_task() -> int | None:
+    """Return the 1-based tool step for this task, or ``None`` if unset."""
+    task = asyncio.current_task()
+    if task is None:
+        return None
+    return _agent_tool_step_by_task.get(task)

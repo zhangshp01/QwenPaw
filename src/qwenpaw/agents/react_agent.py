@@ -375,7 +375,37 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
                     f"Failed to register task management tools: {e}",
                 )
 
+        self._register_tool_step_middleware(toolkit)
+
         return toolkit
+
+    @staticmethod
+    def _register_tool_step_middleware(toolkit: Toolkit) -> None:
+        """Assign 1-based ``stepIndex`` per tool execution within one ``reply``.
+
+        Uses ``asyncio.current_task()`` so ``parallel_tool_calls`` does not
+        mix indices. Cleared in middleware ``finally`` after each tool run.
+        """
+        from ..config.context import (
+            clear_agent_tool_step_for_running_task,
+            set_agent_tool_step_for_running_task,
+        )
+
+        setattr(toolkit, "_qwenpaw_tool_step_seq", 0)
+        setattr(toolkit, "_qwenpaw_tool_step_lock", asyncio.Lock())
+
+        async def _tool_step_middleware(kwargs: dict, next_handler):
+            async with toolkit._qwenpaw_tool_step_lock:  # type: ignore[attr-defined]
+                toolkit._qwenpaw_tool_step_seq += 1  # type: ignore[attr-defined]
+                step = toolkit._qwenpaw_tool_step_seq  # type: ignore[attr-defined]
+            set_agent_tool_step_for_running_task(step)
+            try:
+                async for chunk in await next_handler(**kwargs):
+                    yield chunk
+            finally:
+                clear_agent_tool_step_for_running_task()
+
+        toolkit.register_middleware(_tool_step_middleware)
 
     def _register_skills(self, toolkit: Toolkit) -> None:
         """Load and register skills from workspace directory.
@@ -1361,6 +1391,9 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
 
         # Normal message processing
         logger.info("QwenPawAgent.reply: max_iters=%s", self.max_iters)
+
+        if (tk := getattr(self, "toolkit", None)) is not None:
+            setattr(tk, "_qwenpaw_tool_step_seq", 0)
 
         request_context = getattr(self, "_request_context", {}) or {}
         channel_name = request_context.get("channel", "console")

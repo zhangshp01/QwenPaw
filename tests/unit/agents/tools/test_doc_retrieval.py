@@ -5,6 +5,10 @@ import asyncio
 from unittest.mock import patch
 
 from qwenpaw.agents.tools.doc_retrieval import doc_retrieval
+from qwenpaw.config.context import (
+    clear_agent_tool_step_for_running_task,
+    set_agent_tool_step_for_running_task,
+)
 
 
 def _json_block(r) -> dict:
@@ -27,6 +31,7 @@ def test_doc_retrieval_requires_query():
         assert p["errorDetail"]
         assert "query" in p["errorDetail"]
         assert p["normalizedResult"] is None
+        assert p["stepIndex"] == 1
 
     asyncio.run(_run())
 
@@ -65,6 +70,7 @@ def main(query, **kwargs):
         )
         p = _json_block(r)
         assert p["skillName"] == "doc-retrieval"
+        assert p["stepIndex"] == 1
         assert "知识库" in p["displayText"]
         assert p["errorDetail"] is None
         nr = p["normalizedResult"]
@@ -74,6 +80,21 @@ def main(query, **kwargs):
         assert "body" in nr["items"][0]["description"]
         # structured block, not a stringified JSON inside text
         assert r.content[0].get("text") is None
+
+    asyncio.run(_run())
+
+
+def test_doc_retrieval_step_index_from_task_mapping():
+    """Mirrors agent toolkit middleware: stepIndex follows per-task assignment."""
+
+    async def _run():
+        set_agent_tool_step_for_running_task(4)
+        try:
+            r = await doc_retrieval(query="   ")
+            p = _payload(r)
+            assert p["stepIndex"] == 4
+        finally:
+            clear_agent_tool_step_for_running_task()
 
     asyncio.run(_run())
 
