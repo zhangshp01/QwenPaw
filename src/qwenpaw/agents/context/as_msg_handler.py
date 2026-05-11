@@ -51,6 +51,17 @@ class AsMsgHandler:
                         textual_parts[-1],
                     )
 
+                elif block_type == "json":
+                    payload = block.get("json")
+                    if payload is not None:
+                        blob = json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        textual_parts.append(blob)
+                        total_token_count += await self.count_str_token(blob)
+
                 elif block_type in ["image", "audio", "video"]:
                     source = block.get("source", {})
                     if source.get("type") == "base64":

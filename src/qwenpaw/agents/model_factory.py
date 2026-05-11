@@ -11,6 +11,7 @@ Example:
 
 
 import base64
+import json
 import logging
 import os
 from typing import List, Sequence, Tuple, Type, Any, Union, Optional
@@ -334,6 +335,20 @@ def _format_anthropic_output_items(
                     "type": "text",
                     "text": f"File '{filename}' is available at:"
                     f" {readable_path}",
+                },
+            )
+            continue
+
+        if item_type == "json" and item.get("json") is not None:
+            # Anthropic tool_result blocks only allow text / image
+            result.append(
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        item["json"],
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
                 },
             )
             continue
@@ -873,6 +888,27 @@ def _create_file_block_support_formatter(
             """
             if isinstance(output, str):
                 return output, []
+
+            normalized_output: list = []
+            for blk in output:
+                if (
+                    isinstance(blk, dict)
+                    and blk.get("type") == "json"
+                    and blk.get("json") is not None
+                ):
+                    normalized_output.append(
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                blk["json"],
+                                ensure_ascii=False,
+                                indent=2,
+                            ),
+                        },
+                    )
+                else:
+                    normalized_output.append(blk)
+            output = normalized_output
 
             # Try parent class method first
             try:

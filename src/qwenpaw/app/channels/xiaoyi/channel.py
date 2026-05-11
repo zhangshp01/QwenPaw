@@ -1175,11 +1175,20 @@ class XiaoYiChannel(BaseChannel):
                     if isinstance(parsed, list):
                         texts = []
                         for item in parsed:
-                            if (
-                                isinstance(item, dict)
-                                and item.get("type") == "text"
-                            ):
+                            if not isinstance(item, dict):
+                                continue
+                            if item.get("type") == "text":
                                 texts.append(item.get("text", ""))
+                            elif item.get("type") == "json" and item.get(
+                                "json",
+                            ) is not None:
+                                texts.append(
+                                    json.dumps(
+                                        item["json"],
+                                        ensure_ascii=False,
+                                        indent=2,
+                                    ),
+                                )
                         output_str = "\n".join(texts) if texts else str(parsed)
                     elif isinstance(parsed, dict):
                         output_str = json.dumps(

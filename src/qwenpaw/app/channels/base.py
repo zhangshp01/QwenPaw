@@ -1188,6 +1188,12 @@ class BaseChannel(ABC):
                 raw_text = str(block.get("text") or "")
             elif block_type == "thinking":
                 raw_text = str(block.get("thinking") or "")
+            elif block_type == "json" and block.get("json") is not None:
+                raw_text = json.dumps(
+                    block["json"],
+                    ensure_ascii=False,
+                    indent=2,
+                )
             if not raw_text.strip():
                 continue
             preview = self._truncate_stream_tool_chunk(raw_text)

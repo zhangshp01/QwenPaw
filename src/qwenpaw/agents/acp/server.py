@@ -11,6 +11,7 @@ sub-agent delegation, etc.).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -269,7 +270,16 @@ def _extract_tool_output(output: Any) -> str:
         parts = []
         for item in output:
             if isinstance(item, dict):
-                parts.append(item.get("text", str(item)))
+                if item.get("type") == "json" and item.get("json") is not None:
+                    parts.append(
+                        json.dumps(
+                            item["json"],
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                    )
+                else:
+                    parts.append(item.get("text", str(item)))
             else:
                 parts.append(str(item))
         return "\n".join(parts)

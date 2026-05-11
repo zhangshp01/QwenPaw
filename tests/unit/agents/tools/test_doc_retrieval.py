@@ -5,14 +5,28 @@ import asyncio
 from unittest.mock import patch
 
 from qwenpaw.agents.tools.doc_retrieval import doc_retrieval
-from qwenpaw.agents.tools.gov_document_writer import _content_block_text
+
+
+def _json_block(r) -> dict:
+    block = r.content[0]
+    assert isinstance(block, dict)
+    assert block.get("type") == "json"
+    assert "json" in block
+    return block["json"]
+
+
+def _payload(r) -> dict:
+    """Flat tool body (skillName, displayText, …) inside the json block."""
+    return _json_block(r)
 
 
 def test_doc_retrieval_requires_query():
     async def _run():
         r = await doc_retrieval(query="   ")
-        text = _content_block_text(r.content[0])
-        assert text and "query" in text
+        p = _payload(r)
+        assert p["errorDetail"]
+        assert "query" in p["errorDetail"]
+        assert p["normalizedResult"] is None
 
     asyncio.run(_run())
 
@@ -22,8 +36,26 @@ def test_doc_retrieval_uses_workspace_skill_scripts(tmp_path):
         scripts = tmp_path / "skills" / "doc-retrieval" / "scripts"
         scripts.mkdir(parents=True)
         (scripts / "search.py").write_text(
-            "def main(query, **kwargs):\n"
-            "    return f'ok:{query}:fmt={kwargs.get(\"output_format\")}'\n",
+            """
+def search(query, dataset_ids=None, page=1, page_size=10, title="", keywords="", **kwargs):
+    return {
+        "query": query,
+        "dataset_ids": [],
+        "chunks": [
+            {
+                "document_name": "a.txt",
+                "content": "body",
+                "highlight": "",
+                "preview": "prev",
+            }
+        ],
+        "count": 1,
+        "total": 1,
+    }
+
+def main(query, **kwargs):
+    return "legacy"
+""",
             encoding="utf-8",
         )
         r = await doc_retrieval(
@@ -31,7 +63,17 @@ def test_doc_retrieval_uses_workspace_skill_scripts(tmp_path):
             output_format="json",
             workspace_dir=str(tmp_path),
         )
-        assert _content_block_text(r.content[0]) == "ok:hello:fmt=json"
+        p = _json_block(r)
+        assert p["skillName"] == "doc-retrieval"
+        assert "知识库" in p["displayText"]
+        assert p["errorDetail"] is None
+        nr = p["normalizedResult"]
+        assert nr["source"] == "legacy_success"
+        assert nr["itemsTotal"] == 1
+        assert nr["items"][0]["title"] == "a.txt"
+        assert "body" in nr["items"][0]["description"]
+        # structured block, not a stringified JSON inside text
+        assert r.content[0].get("text") is None
 
     asyncio.run(_run())
 
@@ -46,7 +88,7 @@ def test_doc_retrieval_missing_scripts_message(tmp_path):
                 query="x",
                 workspace_dir=str(tmp_path),
             )
-        body = _content_block_text(r.content[0]) or ""
-        assert "未找到" in body
+        p = _payload(r)
+        assert "未找到" in (p.get("errorDetail") or "")
 
     asyncio.run(_run())

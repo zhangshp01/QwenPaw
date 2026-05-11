@@ -128,6 +128,17 @@ class MessageRenderer:
                 if btype == "text" and b.get("text"):
                     result.append(TextContent(text=b["text"]))
                     continue
+                if btype == "json" and b.get("json") is not None:
+                    result.append(
+                        TextContent(
+                            text=json.dumps(
+                                b["json"],
+                                ensure_ascii=False,
+                                indent=2,
+                            ),
+                        ),
+                    )
+                    continue
                 if btype in ("image", "audio", "video", "file"):
                     src = b.get("source") or {}
                     stype = src.get("type")
