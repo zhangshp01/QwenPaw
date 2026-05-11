@@ -51,6 +51,7 @@ from .tools import (
     glob_search,
     grep_search,
     doc_reviewer,
+    doc_retrieval,
     gov_document_writer,
     list_agents,
     read_file,
@@ -323,6 +324,25 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
             )
             logger.debug(
                 "Registered gov document tools: gov-document-writer, 公文写作",
+            )
+
+        # Knowledge base retrieval (doc-retrieval skill → callable tool)
+        if enabled_tools.get("doc_retrieval", True):
+            _doc_ws = str(self._workspace_dir or WORKING_DIR)
+            _doc_preset = {"workspace_dir": _doc_ws}
+            toolkit.register_tool_function(
+                doc_retrieval,
+                namesake_strategy=namesake_strategy,
+                func_name="doc-retrieval",
+                preset_kwargs=_doc_preset,
+            )
+            toolkit.register_tool_function(
+                doc_retrieval,
+                namesake_strategy=namesake_strategy,
+                preset_kwargs=_doc_preset,
+            )
+            logger.debug(
+                "Registered knowledge retrieval tools: doc-retrieval, doc_retrieval",
             )
 
         # Auto-register background task management tools if any *enabled*

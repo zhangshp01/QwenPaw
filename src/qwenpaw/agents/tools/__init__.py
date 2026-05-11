@@ -30,6 +30,7 @@ from .agent_management import (
 )
 from .delegate_external_agent import delegate_external_agent
 from .gov_document_writer import doc_reviewer, gov_document_writer
+from .doc_retrieval import doc_retrieval
 
 __all__ = [
     "execute_python_code",
@@ -57,4 +58,5 @@ __all__ = [
     "check_agent_task",
     "doc_reviewer",
     "gov_document_writer",
+    "doc_retrieval",
 ]

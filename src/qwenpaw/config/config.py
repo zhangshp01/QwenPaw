@@ -1404,6 +1404,15 @@ def _default_builtin_tools() -> Dict[str, BuiltinToolConfig]:
             ),
             icon="📜",
         ),
+        "doc_retrieval": BuiltinToolConfig(
+            name="doc_retrieval",
+            enabled=True,
+            description=(
+                "HaiRuo knowledge-base search (exposed as doc-retrieval / "
+                "doc_retrieval; requires doc-retrieval/scripts under workspace)"
+            ),
+            icon="📚",
+        ),
     }
 
 
