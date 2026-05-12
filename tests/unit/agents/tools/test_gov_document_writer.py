@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from qwenpaw.agents.tools.gov_document_writer import (
+    _parse_document_review_response,
     doc_reviewer,
     gov_document_writer,
 )
@@ -36,21 +40,23 @@ def test_doc_reviewer_requires_input():
         assert p["displayText"] == "文档审核失败"
         detail = p.get("errorDetail") or ""
         assert "content" in detail and ("file_path" in detail or "path" in detail)
+        assert p.get("resultList") is None
 
     asyncio.run(_run())
     async def _run():
         revised = "para1-fixed.\npara2-fixed."
-        fake = AsyncMock(return_value=revised)
+        fake = AsyncMock(return_value=(revised, []))
         with patch(_DOC_REVIEW_PATCH, fake):
             r = await doc_reviewer(content="para1.\npara2.")
         p = _json_payload(r)
         assert p["skillName"] == "doc_reviewer"
         assert p["sourceState"] == "model_success"
-        assert p["displayText"] == "已完成：文档审核"
+        assert p["displayText"] == "已完成：公文审核"
         assert p["stepIndex"] == 1
         nr = p["normalizedResult"]
         assert nr["source"] == "model_success"
         assert nr["document"] == revised
+        assert p["resultList"] == []
         fake.assert_awaited_once()
         assert "para1" in (fake.await_args.args[0] or "")
 
@@ -59,7 +65,7 @@ def test_doc_reviewer_requires_input():
 
 def test_doc_reviewer_reads_file():
     async def _run():
-        fake = AsyncMock(return_value="hello-revised")
+        fake = AsyncMock(return_value=("hello-revised", []))
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             set_current_workspace_dir(root)
@@ -79,7 +85,7 @@ def test_doc_reviewer_reads_file():
 
 def test_doc_reviewer_step_index_from_task_mapping():
     async def _run():
-        fake = AsyncMock(return_value="final-body")
+        fake = AsyncMock(return_value=("final-body", []))
         set_agent_tool_step_for_running_task(2)
         try:
             with patch(_DOC_REVIEW_PATCH, fake):
@@ -101,8 +107,72 @@ def test_doc_reviewer_llm_failure_returns_error():
         assert p["sourceState"] == "error"
         assert p["normalizedResult"] is None
         assert "model-unavailable" in (p.get("errorDetail") or "")
+        assert p.get("resultList") is None
 
     asyncio.run(_run())
+
+
+def test_doc_reviewer_result_list_from_llm_tuple():
+    async def _run():
+        items = [
+            {
+                "reason": "错别字",
+                "offsets": 25,
+                "errorType": "错别字错误",
+                "errorWord": "法展",
+                "contextOffset": 10,
+                "context": "随着大数据技术的迅速法展，",
+                "rightWord": "发展",
+            },
+        ]
+        fake = AsyncMock(return_value=("定稿正文", items))
+        with patch(_DOC_REVIEW_PATCH, fake):
+            r = await doc_reviewer(content="x")
+        p = _json_payload(r)
+        assert p["normalizedResult"]["document"] == "定稿正文"
+        assert len(p["resultList"]) == 1
+        row = p["resultList"][0]
+        assert row["errorWord"] == "法展"
+        assert row["rightWord"] == "发展"
+        assert row["offsets"] == 25
+        assert row["contextOffset"] == 10
+
+    asyncio.run(_run())
+
+
+def test_parse_document_review_response_json():
+    raw = json.dumps(
+        {
+            "document": "后文",
+            "resultList": [
+                {
+                    "reason": "r",
+                    "offsets": 1,
+                    "errorType": "t",
+                    "errorWord": "错",
+                    "contextOffset": 0,
+                    "context": "上下文",
+                    "rightWord": "对",
+                },
+            ],
+        },
+        ensure_ascii=False,
+    )
+    doc, items = _parse_document_review_response(raw)
+    assert doc == "后文"
+    assert len(items) == 1
+    assert items[0]["errorWord"] == "错"
+
+
+def test_parse_document_review_response_plain_text_legacy():
+    doc, items = _parse_document_review_response("  仅正文无JSON  ")
+    assert doc == "仅正文无JSON"
+    assert items == []
+
+
+def test_parse_document_review_response_invalid_document_key():
+    with pytest.raises(RuntimeError, match="document"):
+        _parse_document_review_response('{"document": ""}')
 
 
 def test_gov_document_writer_requires_content():

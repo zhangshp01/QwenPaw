@@ -4,13 +4,14 @@
 
 ``gov_document_writer`` and ``doc_reviewer`` return one
 ``{"type": "json", "json": {...}}`` block (``skillName``, ``stepIndex``,
-``displayText``, ``normalizedResult``, …) aligned with doc-retrieval style
-envelopes.
+``displayText``, ``normalizedResult``, ``resultList`` (doc_reviewer only),
+…) aligned with doc-retrieval style envelopes.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime
@@ -38,16 +39,26 @@ _FALLBACK_STEP_INDEX = 1
 
 logger = logging.getLogger(__name__)
 
-_DOC_REVIEW_LLM_TIMEOUT = 120.0
+_DOC_REVIEW_LLM_TIMEOUT = 600.0
 _DOC_REVIEW_MAX_USER_CHARS = 48_000
 _DOC_REVIEW_SYSTEM_ZH = (
     "你是中文文档校对与润色助手。用户将提供一段待审正文（可能含错别字或表述问题）。\n"
-    "请只做一件事：输出**审核修改后的完整正文**（可直接替换原文使用的定稿）。\n"
-    "要求：\n"
+    "请**只输出一个 JSON 对象**（不要 Markdown 代码围栏、不要输出任何 JSON 以外的说明文字）。\n"
+    "JSON 顶层字段必须为：\n"
+    '  "document": 字符串，审核修改后的完整正文（可直接替换原文的定稿）；\n'
+    '  "resultList": 数组，列出相对用户原文你实际改动过的要点（无改动则为 []）。\n'
+    "resultList 中每一项为对象，字段与含义如下（均为与用户所给**原文**对照）：\n"
+    '  "reason": 判定与修改依据（字符串）；\n'
+    '  "offsets": 问题片段在原文中的起始字符偏移（非负整数，按 Unicode 字符索引从 0 起）；\n'
+    '  "errorType": 问题类型，如「错别字错误」「标点错误」「表述问题」等；\n'
+    '  "errorWord": 原文中的问题片段；\n'
+    '  "contextOffset": 用于展示的上下文在原文中的起始偏移（非负整数）；\n'
+    '  "context": 含问题的短上下文（字符串）；\n'
+    '  "rightWord": 建议替换为的正确写法（删除类可为空字符串）。\n'
+    "正文要求：\n"
     "1）修正错别字、明显用词与标点错误；可在不改变原意的前提下轻微润色；\n"
     "2）尽量保留原文段落换行与层次，不要擅自改成分析报告或条目清单；\n"
-    "3）不要输出「审核说明」「修改意见」等元话语，不要复述任务要求；\n"
-    "4）不要使用 Markdown 代码围栏（不要输出 ```）。"
+    "3）resultList 应与 document 中的修改一致；若无法给出精确 offsets，可填合理近似整数。"
 )
 
 
@@ -143,11 +154,12 @@ def _doc_reviewer_error(detail: str) -> ToolResponse:
             "sourceState": _SOURCE_ERR,
             "errorDetail": detail,
             "normalizedResult": None,
+            "resultList": None,
         },
     )
 
 
-def _doc_reviewer_ok(document: str) -> ToolResponse:
+def _doc_reviewer_ok(document: str, result_list: list[dict[str, Any]]) -> ToolResponse:
     return _doc_reviewer_json(
         {
             "skillName": _SKILL_NAME_DOC_REVIEWER_EN,
@@ -160,6 +172,7 @@ def _doc_reviewer_ok(document: str) -> ToolResponse:
                 "document": document,
                 "source": _SOURCE_OK,
             },
+            "resultList": result_list,
         },
     )
 
@@ -179,8 +192,77 @@ def _strip_outer_code_fence(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-async def _run_document_review_llm(draft: str) -> str:
-    """Call the active chat model once to produce the revised document body."""
+def _coerce_offset(val: Any) -> int | None:
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int) and val >= 0:
+        return val
+    if isinstance(val, float) and val >= 0 and val.is_integer():
+        return int(val)
+    if isinstance(val, str) and val.strip():
+        try:
+            n = int(val.strip())
+            return n if n >= 0 else None
+        except ValueError:
+            return None
+    return None
+
+
+def _normalize_review_item(raw: dict[str, Any]) -> dict[str, Any]:
+    """Shape one resultList entry for stable JSON (frontend / 工作区技能)."""
+    off = _coerce_offset(raw.get("offsets"))
+    ctx_off = _coerce_offset(raw.get("contextOffset"))
+    return {
+        "reason": str(raw.get("reason") or "").strip(),
+        "offsets": off,
+        "errorType": str(raw.get("errorType") or "").strip(),
+        "errorWord": str(raw.get("errorWord") or "").strip(),
+        "contextOffset": ctx_off,
+        "context": str(raw.get("context") or "").strip(),
+        "rightWord": str(raw.get("rightWord") or "").strip(),
+    }
+
+
+def _parse_document_review_response(raw: str) -> tuple[str, list[dict[str, Any]]]:
+    """Parse model output: JSON with document + resultList, else whole text + []."""
+    text = _strip_outer_code_fence(raw or "").strip()
+    if not text:
+        raise RuntimeError("模型未返回内容。")
+
+    data: Any = None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        brace = text.find("{")
+        if brace >= 0:
+            try:
+                data, _ = json.JSONDecoder().raw_decode(text[brace:])
+            except json.JSONDecodeError:
+                data = None
+
+    if isinstance(data, dict):
+        doc = data.get("document")
+        if isinstance(doc, str) and doc.strip():
+            items_raw = data.get("resultList")
+            out_list: list[dict[str, Any]] = []
+            if isinstance(items_raw, list):
+                for it in items_raw:
+                    if isinstance(it, dict):
+                        out_list.append(_normalize_review_item(it))
+            return doc.strip(), out_list
+        raise RuntimeError("模型返回的 JSON 缺少非空的 document 字符串。")
+
+    if data is not None:
+        raise RuntimeError(
+            "模型返回的 JSON 顶层必须是对象，且含非空字符串字段 document。",
+        )
+
+    # Legacy: plain-text full body only (non-JSON or non-object)
+    return text.strip(), []
+
+
+async def _run_document_review_llm(draft: str) -> tuple[str, list[dict[str, Any]]]:
+    """Call the active chat model once; return (revised body, structured issues)."""
     from agentscope_runtime.engine.schemas.exception import AppBaseException
 
     from ...app.agent_context import get_current_agent_id
@@ -203,7 +285,11 @@ async def _run_document_review_llm(draft: str) -> str:
         {"role": "system", "content": _DOC_REVIEW_SYSTEM_ZH},
         {
             "role": "user",
-            "content": f"以下为待审正文，请只输出修改定稿后的完整正文：\n\n{trimmed}",
+            "content": (
+                "以下为待审正文。请严格按系统说明只输出 JSON（含 document 与 "
+                "resultList）：\n\n"
+                f"{trimmed}"
+            ),
         },
     ]
     try:
@@ -216,10 +302,7 @@ async def _run_document_review_llm(draft: str) -> str:
             f"文档审核超时（{_DOC_REVIEW_LLM_TIMEOUT:.0f}s）。",
         ) from exc
 
-    revised = _strip_outer_code_fence(revised or "")
-    if not revised.strip():
-        raise RuntimeError("模型未返回修改后正文。")
-    return revised.strip()
+    return _parse_document_review_response(revised or "")
 
 
 async def doc_reviewer(
@@ -235,7 +318,8 @@ async def doc_reviewer(
     ``file_path`` / ``path`` (same resolution as :func:`read_file`).
 
     Returns a JSON envelope; ``normalizedResult.document`` is the
-    **审核修改后正文** (LLM-revised full text), not a separate audit memo.
+    **审核修改后正文** (LLM-revised full text). Top-level ``resultList`` holds
+    structured change entries (``reason``, ``offsets``, ``errorType``, …).
     """
     body = (content or "").strip()
     max_bytes = get_current_recent_max_bytes() or DEFAULT_MAX_BYTES
@@ -262,10 +346,14 @@ async def doc_reviewer(
             return _doc_reviewer_error(draft)
 
     try:
-        revised = await _run_document_review_llm(draft)
+        revised, result_list = await _run_document_review_llm(draft)
     except Exception as exc:  # noqa: BLE001
         logger.warning("doc_reviewer: revise LLM failed: %s", exc)
         return _doc_reviewer_error(str(exc))
+
+    normalized_items = [
+        _normalize_review_item(x) for x in result_list if isinstance(x, dict)
+    ]
 
     out_lines = revised.count("\n") + (1 if revised else 0)
     document_out = truncate_text_output(
@@ -275,7 +363,7 @@ async def doc_reviewer(
         max_bytes=max_bytes,
         file_path="<revised-document>",
     )
-    return _doc_reviewer_ok(document_out)
+    return _doc_reviewer_ok(document_out, normalized_items)
 
 
 async def gov_document_writer(
