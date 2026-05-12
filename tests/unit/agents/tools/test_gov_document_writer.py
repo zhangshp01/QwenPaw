@@ -4,9 +4,9 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from qwenpaw.agents.tools.gov_document_writer import (
-    _content_block_text,
     doc_reviewer,
     gov_document_writer,
 )
@@ -15,6 +15,8 @@ from qwenpaw.config.context import (
     set_agent_tool_step_for_running_task,
     set_current_workspace_dir,
 )
+
+_DOC_REVIEW_PATCH = "qwenpaw.agents.tools.gov_document_writer._run_document_review_llm"
 
 
 def _json_payload(r):
@@ -27,37 +29,78 @@ def _json_payload(r):
 def test_doc_reviewer_requires_input():
     async def _run():
         r = await doc_reviewer(content="", file_path="", path="")
-        text = _content_block_text(r.content[0])
-        assert text
-        assert (
-            ("file_path" in text or "path" in text)
-            and "content" in text
-        )
+        p = _json_payload(r)
+        assert p["skillName"] == "doc_reviewer"
+        assert p["sourceState"] == "error"
+        assert p["normalizedResult"] is None
+        assert p["displayText"] == "文档审核失败"
+        detail = p.get("errorDetail") or ""
+        assert "content" in detail and ("file_path" in detail or "path" in detail)
 
     asyncio.run(_run())
-
-
-def test_doc_reviewer_accepts_content():
     async def _run():
-        r = await doc_reviewer(content="第一段。\n第二段。")
-        text = _content_block_text(r.content[0])
-        assert text
-        assert "第一段" in text
+        revised = "para1-fixed.\npara2-fixed."
+        fake = AsyncMock(return_value=revised)
+        with patch(_DOC_REVIEW_PATCH, fake):
+            r = await doc_reviewer(content="para1.\npara2.")
+        p = _json_payload(r)
+        assert p["skillName"] == "doc_reviewer"
+        assert p["sourceState"] == "model_success"
+        assert p["displayText"] == "已完成：文档审核"
+        assert p["stepIndex"] == 1
+        nr = p["normalizedResult"]
+        assert nr["source"] == "model_success"
+        assert nr["document"] == revised
+        fake.assert_awaited_once()
+        assert "para1" in (fake.await_args.args[0] or "")
 
     asyncio.run(_run())
 
 
 def test_doc_reviewer_reads_file():
     async def _run():
+        fake = AsyncMock(return_value="hello-revised")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             set_current_workspace_dir(root)
             p = root / "draft.md"
             p.write_text("# T\n\nhello", encoding="utf-8")
-            r = await doc_reviewer(file_path="draft.md")
-            text = _content_block_text(r.content[0])
-            assert text
-            assert "hello" in text
+            with patch(_DOC_REVIEW_PATCH, fake):
+                r = await doc_reviewer(file_path="draft.md")
+            payload = _json_payload(r)
+            assert payload["skillName"] == "doc_reviewer"
+            assert payload["displayText"] == "已完成：文档审核"
+            assert payload["normalizedResult"]["document"] == "hello-revised"
+            fake.assert_awaited_once()
+            assert "hello" in (fake.await_args.args[0] or "")
+
+    asyncio.run(_run())
+
+
+def test_doc_reviewer_step_index_from_task_mapping():
+    async def _run():
+        fake = AsyncMock(return_value="final-body")
+        set_agent_tool_step_for_running_task(2)
+        try:
+            with patch(_DOC_REVIEW_PATCH, fake):
+                r = await doc_reviewer(content="x")
+            p = _json_payload(r)
+            assert p["stepIndex"] == 2
+        finally:
+            clear_agent_tool_step_for_running_task()
+
+    asyncio.run(_run())
+
+
+def test_doc_reviewer_llm_failure_returns_error():
+    async def _run():
+        fake = AsyncMock(side_effect=RuntimeError("model-unavailable"))
+        with patch(_DOC_REVIEW_PATCH, fake):
+            r = await doc_reviewer(content="one line.")
+        p = _json_payload(r)
+        assert p["sourceState"] == "error"
+        assert p["normalizedResult"] is None
+        assert "model-unavailable" in (p.get("errorDetail") or "")
 
     asyncio.run(_run())
 

@@ -2,20 +2,21 @@
 """Formal / gov-style document draft (``gov_document_writer``) and review
 (``doc_reviewer``) helpers for AgentLoop.
 
-``gov_document_writer`` returns one ``{"type": "json", "json": {...}}`` block
-(flat ``json`` object: ``skillName``, ``stepIndex``, ``displayText``, …) aligned
-with doc-retrieval style envelopes.
+``gov_document_writer`` and ``doc_reviewer`` return one
+``{"type": "json", "json": {...}}`` block (``skillName``, ``stepIndex``,
+``displayText``, ``normalizedResult``, …) aligned with doc-retrieval style
+envelopes.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from agentscope.message import TextBlock
 from agentscope.tool import ToolResponse
 
 from ...config.context import (
@@ -26,11 +27,28 @@ from .file_io import _resolve_file_path, read_file
 from .utils import DEFAULT_MAX_BYTES, truncate_text_output
 
 _SKILL_NAME_EN = "gov-document-writer"
+_SKILL_NAME_DOC_REVIEWER_EN = "doc_reviewer"
 _DISPLAY_OK_ZH = "已完成：公文写作"
 _DISPLAY_ERR_ZH = "公文写作失败"
+_DISPLAY_OK_DOC_REVIEW_ZH = "已完成：文档审核"
+_DISPLAY_ERR_DOC_REVIEW_ZH = "文档审核失败"
 _SOURCE_OK = "model_success"
 _SOURCE_ERR = "error"
 _FALLBACK_STEP_INDEX = 1
+
+logger = logging.getLogger(__name__)
+
+_DOC_REVIEW_LLM_TIMEOUT = 120.0
+_DOC_REVIEW_MAX_USER_CHARS = 48_000
+_DOC_REVIEW_SYSTEM_ZH = (
+    "你是中文文档校对与润色助手。用户将提供一段待审正文（可能含错别字或表述问题）。\n"
+    "请只做一件事：输出**审核修改后的完整正文**（可直接替换原文使用的定稿）。\n"
+    "要求：\n"
+    "1）修正错别字、明显用词与标点错误；可在不改变原意的前提下轻微润色；\n"
+    "2）尽量保留原文段落换行与层次，不要擅自改成分析报告或条目清单；\n"
+    "3）不要输出「审核说明」「修改意见」等元话语，不要复述任务要求；\n"
+    "4）不要使用 Markdown 代码围栏（不要输出 ```）。"
+)
 
 
 def _content_block_text(block: Any) -> str | None:
@@ -110,6 +128,100 @@ def _gov_writer_error(detail: str) -> ToolResponse:
     )
 
 
+def _doc_reviewer_json(root: dict[str, Any]) -> ToolResponse:
+    return ToolResponse(content=[{"type": "json", "json": root}])
+
+
+def _doc_reviewer_error(detail: str) -> ToolResponse:
+    detail = (detail or "").strip() or "unknown"
+    return _doc_reviewer_json(
+        {
+            "skillName": _SKILL_NAME_DOC_REVIEWER_EN,
+            "stepIndex": _writer_step_index(),
+            "displayText": _DISPLAY_ERR_DOC_REVIEW_ZH,
+            "retryable": True,
+            "sourceState": _SOURCE_ERR,
+            "errorDetail": detail,
+            "normalizedResult": None,
+        },
+    )
+
+
+def _doc_reviewer_ok(document: str) -> ToolResponse:
+    return _doc_reviewer_json(
+        {
+            "skillName": _SKILL_NAME_DOC_REVIEWER_EN,
+            "stepIndex": _writer_step_index(),
+            "displayText": _DISPLAY_OK_DOC_REVIEW_ZH,
+            "retryable": True,
+            "sourceState": _SOURCE_OK,
+            "errorDetail": None,
+            "normalizedResult": {
+                "document": document,
+                "source": _SOURCE_OK,
+            },
+        },
+    )
+
+
+def _strip_outer_code_fence(text: str) -> str:
+    """If the model wrapped the body in a Markdown fence, return inner text."""
+    t = (text or "").strip()
+    if not t.startswith("```"):
+        return t
+    lines = t.split("\n")
+    if not lines:
+        return t
+    if lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+async def _run_document_review_llm(draft: str) -> str:
+    """Call the active chat model once to produce the revised document body."""
+    from agentscope_runtime.engine.schemas.exception import AppBaseException
+
+    from ...app.agent_context import get_current_agent_id
+    from ...app.runner.title_generator import _consume_model_response
+    from ..model_factory import create_model_and_formatter
+
+    trimmed = (draft or "").strip()
+    if len(trimmed) > _DOC_REVIEW_MAX_USER_CHARS:
+        trimmed = trimmed[:_DOC_REVIEW_MAX_USER_CHARS].rstrip() + "\n\n[…正文已截断…]"
+
+    agent_id = get_current_agent_id()
+    try:
+        model, _ = create_model_and_formatter(agent_id=agent_id)
+    except (ValueError, AppBaseException, OSError) as exc:
+        raise RuntimeError(
+            "未配置可用的对话模型，无法生成修改后正文。",
+        ) from exc
+
+    messages = [
+        {"role": "system", "content": _DOC_REVIEW_SYSTEM_ZH},
+        {
+            "role": "user",
+            "content": f"以下为待审正文，请只输出修改定稿后的完整正文：\n\n{trimmed}",
+        },
+    ]
+    try:
+        revised = await asyncio.wait_for(
+            _consume_model_response(model, messages),
+            timeout=_DOC_REVIEW_LLM_TIMEOUT,
+        )
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            f"文档审核超时（{_DOC_REVIEW_LLM_TIMEOUT:.0f}s）。",
+        ) from exc
+
+    revised = _strip_outer_code_fence(revised or "")
+    if not revised.strip():
+        raise RuntimeError("模型未返回修改后正文。")
+    return revised.strip()
+
+
 async def doc_reviewer(
     content: str = "",
     file_path: str = "",
@@ -117,38 +229,53 @@ async def doc_reviewer(
     start_line: int | None = None,
     end_line: int | None = None,
 ) -> ToolResponse:
-    """Inline or file-based draft for review (校对、审阅、提修改建议).
+    """Inline or file-based draft for review (校对、审阅、定稿).
 
     Exposed to the model as ``doc_reviewer``. Pass ``content`` and/or
     ``file_path`` / ``path`` (same resolution as :func:`read_file`).
+
+    Returns a JSON envelope; ``normalizedResult.document`` is the
+    **审核修改后正文** (LLM-revised full text), not a separate audit memo.
     """
     body = (content or "").strip()
+    max_bytes = get_current_recent_max_bytes() or DEFAULT_MAX_BYTES
     if body:
-        max_bytes = get_current_recent_max_bytes() or DEFAULT_MAX_BYTES
         total_lines = body.count("\n") + (1 if body else 0)
-        text = truncate_text_output(
+        draft = truncate_text_output(
             body,
             start_line=1,
             total_lines=total_lines,
             max_bytes=max_bytes,
             file_path="<inline-review>",
         )
-        return ToolResponse(content=[TextBlock(type="text", text=text)])
+    else:
+        target = (file_path or path or "").strip()
+        if not target:
+            return _doc_reviewer_error(
+                "错误：缺少待审阅内容。请传入 content（正文），"
+                "或 file_path / path（工作区文稿路径）。",
+            )
+        read_resp = await read_file(target, start_line=start_line, end_line=end_line)
+        block0 = read_resp.content[0] if read_resp.content else None
+        draft = _content_block_text(block0) or ""
+        if draft.startswith("Error:"):
+            return _doc_reviewer_error(draft)
 
-    target = (file_path or path or "").strip()
-    if not target:
-        return ToolResponse(
-            content=[
-                TextBlock(
-                    type="text",
-                    text=(
-                        "错误：缺少待审阅内容。请传入 content（正文），"
-                        "或 file_path / path（工作区文稿路径）。"
-                    ),
-                ),
-            ],
-        )
-    return await read_file(target, start_line=start_line, end_line=end_line)
+    try:
+        revised = await _run_document_review_llm(draft)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("doc_reviewer: revise LLM failed: %s", exc)
+        return _doc_reviewer_error(str(exc))
+
+    out_lines = revised.count("\n") + (1 if revised else 0)
+    document_out = truncate_text_output(
+        revised,
+        start_line=1,
+        total_lines=out_lines,
+        max_bytes=max_bytes,
+        file_path="<revised-document>",
+    )
+    return _doc_reviewer_ok(document_out)
 
 
 async def gov_document_writer(
