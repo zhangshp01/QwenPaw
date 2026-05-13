@@ -5,7 +5,7 @@
 ``gov_document_writer``, ``gov_document_layout``, and ``doc_reviewer`` return one
 ``{"type": "json", "json": {...}}`` block (``skillName``, ``stepIndex``,
 ``displayText``, ``normalizedResult`` (writer / reviewer), ``resultList``
-(layout: ``{total, list}``; reviewer: issue rows), …) aligned with doc-retrieval
+(layout: optional ``recommended`` only; full template rows are not returned), …) aligned with doc-retrieval
 style envelopes.  ``gov_document_layout`` reports ``skillName`` ``gov_document_layout``;
 it may call HaiRuo ``layoutTemplate`` when ``template_title`` is set (see
 ``hairuo_gov_layout``).  Layout success payloads omit ``normalizedResult`` when
@@ -107,12 +107,15 @@ def _normalize_layout_template_list_payload(
     *,
     templates_json: str = "",
 ) -> dict[str, Any]:
-    """Return ``{"total": n, "list": [...]}`` for ``gov_document_layout`` responses."""
-    empty: dict[str, Any] = {"total": 0, "list": []}
+    """Return ``{"templates": [...]}`` for ``gov_document_layout`` payloads.
+
+    Accepts legacy shapes ``{"list", "total"}`` when callers pass explicit ``resultList``.
+    """
+    empty: dict[str, Any] = {"templates": []}
 
     def from_list(lst: list[Any]) -> dict[str, Any]:
         items = [x for x in lst if isinstance(x, dict)]
-        return {"total": len(items), "list": items}
+        return {"templates": items}
 
     if isinstance(raw, str):
         s = raw.strip()
@@ -125,15 +128,14 @@ def _normalize_layout_template_list_payload(
             raw = None
 
     if isinstance(raw, dict):
+        t_new = raw.get("templates")
+        if isinstance(t_new, list):
+            items = [x for x in t_new if isinstance(x, dict)]
+            return {"templates": items}
         lst = raw.get("list")
         if isinstance(lst, list):
             items = [x for x in lst if isinstance(x, dict)]
-            tv = raw.get("total", len(items))
-            try:
-                total = int(tv)
-            except (TypeError, ValueError):
-                total = len(items)
-            return {"total": total, "list": items}
+            return {"templates": items}
         return empty
     if isinstance(raw, list):
         return from_list(raw)
@@ -165,7 +167,7 @@ def _layout_result_list_from_tool_locals(_locals: dict[str, Any]) -> dict[str, A
             if isinstance(ex_t, str):
                 templates = ex_t
     out = _normalize_layout_template_list_payload(raw, templates_json=templates)
-    if out["total"] == 0 and isinstance(extra, dict):
+    if not (out.get("templates") or []) and isinstance(extra, dict):
         ex_t2 = extra.get("templates")
         if isinstance(ex_t2, str) and ex_t2.strip():
             out = _normalize_layout_template_list_payload(
@@ -173,6 +175,17 @@ def _layout_result_list_from_tool_locals(_locals: dict[str, Any]) -> dict[str, A
                 templates_json=ex_t2,
             )
     return out
+
+
+_LAYOUT_RESULT_CLIENT_DROP: frozenset[str] = frozenset({"templates", "list", "total"})
+
+
+def _layout_result_list_for_client(rl: dict[str, Any]) -> dict[str, Any] | None:
+    """Omit ``templates`` / legacy ``list`` / ``total`` from layout tool JSON."""
+    if not isinstance(rl, dict):
+        return None
+    out = {k: v for k, v in rl.items() if k not in _LAYOUT_RESULT_CLIENT_DROP}
+    return out if out else None
 
 
 def _write_gov_docx(
@@ -382,18 +395,19 @@ def _gov_doc_tool_json(root: dict[str, Any]) -> ToolResponse:
 
 def _gov_layout_ok_json_no_docx(result_list: dict[str, Any]) -> ToolResponse:
     """layoutTemplate-only success: no ``.docx``, ``savePath`` is null."""
-    return _gov_doc_tool_json(
-        {
-            "skillName": _SKILL_NAME_LAYOUT_EN,
-            "stepIndex": _writer_step_index(),
-            "displayText": _DISPLAY_OK_LAYOUT_ZH,
-            "retryable": True,
-            "sourceState": _SOURCE_OK,
-            "errorDetail": None,
-            "savePath": None,
-            "resultList": result_list,
-        },
-    )
+    root: dict[str, Any] = {
+        "skillName": _SKILL_NAME_LAYOUT_EN,
+        "stepIndex": _writer_step_index(),
+        "displayText": _DISPLAY_OK_LAYOUT_ZH,
+        "retryable": True,
+        "sourceState": _SOURCE_OK,
+        "errorDetail": None,
+        "savePath": None,
+    }
+    client_rl = _layout_result_list_for_client(result_list)
+    if client_rl is not None:
+        root["resultList"] = client_rl
+    return _gov_doc_tool_json(root)
 
 
 def _gov_doc_tool_error(
@@ -730,7 +744,9 @@ async def _save_gov_style_docx(
             "source": _SOURCE_OK,
         }
     if layout_result_list is not None:
-        root["resultList"] = layout_result_list
+        client_rl = _layout_result_list_for_client(layout_result_list)
+        if client_rl is not None:
+            root["resultList"] = client_rl
     return _gov_doc_tool_json(root)
 
 
@@ -805,6 +821,9 @@ async def gov_document_writer(
 def _layout_explicit_nonempty(rl: dict[str, Any]) -> bool:
     if not isinstance(rl, dict):
         return False
+    t = rl.get("templates")
+    if isinstance(t, list) and len(t) > 0:
+        return True
     lst = rl.get("list")
     if isinstance(lst, list) and len(lst) > 0:
         return True
@@ -899,7 +918,7 @@ async def gov_document_layout(
     **HaiRuo 查模板（可选）**：传入非空 ``template_title`` / ``templateTitle``（或
     ``**extra`` 中同名键）时，工具在进程内请求 ``layoutTemplate``，每次调用都会
     重新读取配置（见 ``hairuo_gov_layout``：``config.json``、可选 JSON、环境变量；
-    **不**读取 ``gov-document-layout/`` 工作区目录），便于热更新。仅查模板不传正文时返回 ``savePath: null`` 与 ``resultList``。
+    **不**读取 ``gov-document-layout/`` 工作区目录），便于热更新。仅查模板不传正文时返回 ``savePath: null``；``resultList`` 仅在存在需下发的内容时出现（例如配置了推荐时的 ``recommended``），**不**返回完整模板表字段 ``templates``（亦不含 ``list``/``total``）。
 
     若同时传入显式 ``resultList`` / ``templates`` 且非空，则优先使用显式列表，
     否则使用接口返回的列表。成功写 docx 时响应 **不含** ``normalizedResult``。

@@ -24,7 +24,7 @@ def test_fetch_layout_template_result_list_success(mock_load, mock_req) -> None:
         "data": {"total": 1, "list": [{"id": "t1", "name": "上行文"}]},
     }
     out = fetch_layout_template_result_list("上行文", page=1, page_size=10)
-    assert out == {"total": 1, "list": [{"id": "t1"}]}
+    assert out == {"templates": [{"id": "t1"}]}
     assert "recommended" not in out
 
 
@@ -57,14 +57,12 @@ def test_fetch_layout_template_array_data_shape(mock_load, mock_req) -> None:
         ],
     }
     out = fetch_layout_template_result_list("场景", page=1, page_size=1)
-    assert out["total"] == 2
-    assert len(out["list"]) == 2
-    assert [x["id"] for x in out["list"]] == ["a", "b"]
+    assert len(out["templates"]) == 2
+    assert [x["id"] for x in out["templates"]] == ["a", "b"]
 
     out2 = fetch_layout_template_result_list("场景", page=99, page_size=1)
-    assert out2["total"] == 2
-    assert len(out2["list"]) == 2
-    assert [x["id"] for x in out2["list"]] == ["a", "b"]
+    assert len(out2["templates"]) == 2
+    assert [x["id"] for x in out2["templates"]] == ["a", "b"]
 
 
 @patch("qwenpaw.agents.tools.hairuo_gov_layout._post_layout_recommend_json")
@@ -110,8 +108,7 @@ def test_fetch_layout_template_with_recommendation(
         ],
     }
     out = fetch_layout_template_result_list("国庆节放假通知", page=1, page_size=10)
-    assert out["total"] == 2
-    assert len(out["list"]) == 2
+    assert len(out["templates"]) == 2
     assert out["recommended"] == [
         {
             "id": "a",

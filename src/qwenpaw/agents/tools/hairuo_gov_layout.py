@@ -520,14 +520,14 @@ def fetch_layout_template_result_list(
     page_size: int = 10000,
     explicit_defaults_path: str = "",
 ) -> dict[str, Any]:
-    """Call HaiRuo layoutTemplate and return ``data`` as ``{"total", "list"}``.
+    """Call HaiRuo layoutTemplate and return ``{"templates": [...]}``.
 
     Supports ``data`` as either a **list** of template objects (``.../layoutTemplate/get``)
     or a legacy **object** with ``{"list", "total"}``. When ``data`` is a top-level array,
-    ``list`` and ``total`` reflect the **full** response (``page`` / ``page_size`` are ignored).
+    ``templates`` holds the **full** response (``page`` / ``page_size`` are ignored).
 
     When ``recommend_chat_url`` is set (config or ``GOV_LAYOUT_RECOMMEND_CHAT_URL``),
-    the response also includes ``recommended``: up to two list entries chosen by an
+    the response also includes ``recommended``: up to two template entries chosen by an
     OpenAI-compatible chat model from ``template_title`` as the user 公文场景描述.
     """
     title = (template_title or "").strip()
@@ -558,54 +558,41 @@ def fetch_layout_template_result_list(
         )
         raise GovLayoutHttpError(str(message))
     data = payload.get("data")
-    _KEEP_KEYS = ("id", "templateTitle", "industryTag", "share", "templateType", "layoutContent", "count")
+    _KEEP_KEYS = ("id", "templateTitle", "industryTag", "share", "templateType", "count")
 
     def _pick_item(x: dict) -> dict:
         return {k: x[k] for k in _KEEP_KEYS if k in x}
 
     items: list[dict[str, Any]]
-    total: int
     for_recommend: list[dict[str, Any]]
 
     if isinstance(data, list):
         raw = [x for x in data if isinstance(x, dict)]
         for_recommend = [_pick_item(x) for x in raw]
-        total = len(for_recommend)
         items = for_recommend
     elif isinstance(data, dict):
         lst = data.get("list")
         if isinstance(lst, list):
             for_recommend = [_pick_item(x) for x in lst if isinstance(x, dict)]
             items = for_recommend
-            tv = data.get("total", len(items))
-            try:
-                total = int(tv)
-            except (TypeError, ValueError):
-                total = len(items)
         else:
             for_recommend = []
             items = []
-            tv = data.get("total", 0)
-            try:
-                total = int(tv)
-            except (TypeError, ValueError):
-                total = 0
     else:
         logger.info(
             "HaiRuo layoutTemplate success: template_title=%r empty_or_non_object_data=%r",
             title,
             type(data).__name__,
         )
-        result = {"total": 0, "list": []}
+        result = {"templates": []}
         _attach_recommended_if_configured(result, defaults, [], title)
         return result
 
     logger.info(
-        "HaiRuo layoutTemplate success: template_title=%r total=%s list_items=%s",
+        "HaiRuo layoutTemplate success: template_title=%r template_count=%s",
         title,
-        total,
         len(items),
     )
-    result = {"total": total, "list": items}
+    result = {"templates": items}
     _attach_recommended_if_configured(result, defaults, for_recommend, title)
     return result

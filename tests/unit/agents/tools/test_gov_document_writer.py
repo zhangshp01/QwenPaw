@@ -248,7 +248,7 @@ def test_gov_document_layout_from_file_path_only():
             assert p["skillName"] == "gov_document_layout"
             assert p["sourceState"] == "model_success"
             assert "normalizedResult" not in p
-            assert p["resultList"] == {"total": 0, "list": []}
+            assert "resultList" not in p
             combined = _docx_combined_text(p["savePath"])
             assert "从文件读取的正文" in combined
 
@@ -268,7 +268,7 @@ def test_gov_document_layout_main_text_camel_param():
             p = _json_payload(r)
             assert p["sourceState"] == "model_success"
             assert "normalizedResult" not in p
-            assert p["resultList"]["total"] == 0
+            assert "resultList" not in p
             combined = _docx_combined_text(p["savePath"])
             assert "camelCase" in combined
 
@@ -361,7 +361,7 @@ def test_gov_document_layout_writes_file():
             assert p["sourceState"] == "model_success"
             assert p["displayText"] == "已完成：公文排版"
             assert "normalizedResult" not in p
-            assert p["resultList"] == {"total": 0, "list": []}
+            assert "resultList" not in p
             sp = (p.get("savePath") or "").replace("\\", "/")
             assert "govdocs" in sp
             assert sp.lower().endswith(".docx")
@@ -423,11 +423,10 @@ def test_gov_document_layout_result_list_from_templates_json():
             )
             p = _json_payload(r)
             assert "normalizedResult" not in p
-            rl = p["resultList"]
-            assert rl["total"] == 2
-            assert len(rl["list"]) == 2
-            assert rl["list"][0]["templateTitle"] == "市局党委上行文"
-            assert rl["list"][1]["documentType"] == "kmdangweixiaxingwen"
+            assert "resultList" not in p
+            combined = _docx_combined_text(p["savePath"])
+            assert "示例标题" in combined
+            assert "示例正文" in combined
 
     asyncio.run(_run())
 
@@ -438,14 +437,31 @@ def test_gov_document_layout_query_only_mocked_fetch():
             set_current_workspace_dir(Path(td))
             with patch(
                 "qwenpaw.agents.tools.gov_document_writer.fetch_layout_template_result_list",
-                return_value={"total": 1, "list": [{"id": "1"}]},
+                return_value={"templates": [{"id": "1"}]},
             ) as mock_fetch:
                 r = await gov_document_layout(template_title="上行文")
             mock_fetch.assert_called_once()
             p = _json_payload(r)
             assert p["savePath"] is None
             assert p["sourceState"] == "model_success"
-            assert p["resultList"]["total"] == 1
+            assert "resultList" not in p
+
+    asyncio.run(_run())
+
+
+def test_gov_document_layout_client_json_omits_templates_keeps_recommended():
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            set_current_workspace_dir(Path(td))
+            rec = [{"id": "a", "templateTitle": "T"}]
+            with patch(
+                "qwenpaw.agents.tools.gov_document_writer.fetch_layout_template_result_list",
+                return_value={"templates": [{"id": "a", "templateTitle": "T"}], "recommended": rec},
+            ):
+                r = await gov_document_layout(template_title="场景")
+            p = _json_payload(r)
+            assert p["resultList"] == {"recommended": rec}
+            assert "templates" not in p["resultList"]
 
     asyncio.run(_run())
 
@@ -456,7 +472,7 @@ def test_gov_document_layout_content_and_template_title_uses_fetched_result_list
             set_current_workspace_dir(Path(td))
             with patch(
                 "qwenpaw.agents.tools.gov_document_writer.fetch_layout_template_result_list",
-                return_value={"total": 3, "list": [{"id": "a"}]},
+                return_value={"templates": [{"id": "a"}]},
             ):
                 r = await gov_document_layout(
                     template_title="党委",
@@ -465,8 +481,7 @@ def test_gov_document_layout_content_and_template_title_uses_fetched_result_list
                 )
             p = _json_payload(r)
             assert p["savePath"]
-            assert p["resultList"]["total"] == 3
-            assert len(p["resultList"]["list"]) == 1
+            assert "resultList" not in p
 
     asyncio.run(_run())
 
