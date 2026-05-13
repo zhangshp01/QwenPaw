@@ -12,6 +12,7 @@ import pytest
 from qwenpaw.agents.tools.gov_document_writer import (
     _parse_document_review_response,
     doc_reviewer,
+    gov_document_layout,
     gov_document_writer,
 )
 from qwenpaw.config.context import (
@@ -28,6 +29,13 @@ def _json_payload(r):
     assert isinstance(block, dict)
     assert block.get("type") == "json"
     return block["json"]
+
+
+def _docx_combined_text(save_path: str) -> str:
+    from docx import Document as DocxDocument
+
+    d = DocxDocument(save_path)
+    return "\n".join(para.text for para in d.paragraphs)
 
 
 def test_doc_reviewer_requires_input():
@@ -51,7 +59,7 @@ def test_doc_reviewer_requires_input():
         p = _json_payload(r)
         assert p["skillName"] == "doc_reviewer"
         assert p["sourceState"] == "model_success"
-        assert p["displayText"] == "已完成：公文审核"
+        assert p["displayText"] == "已完成：文档审核"
         assert p["stepIndex"] == 1
         nr = p["normalizedResult"]
         assert nr["source"] == "model_success"
@@ -222,6 +230,243 @@ def test_gov_document_writer_writes_file():
             combined = "\n".join(para.text for para in d.paragraphs)
             assert "Holiday Notice" in combined
             assert "Body line one." in combined
+
+    asyncio.run(_run())
+
+
+def test_gov_document_layout_from_file_path_only():
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            set_current_workspace_dir(root)
+            (root / "draft.md").write_text("从文件读取的正文。", encoding="utf-8")
+            r = await gov_document_layout(
+                title="文件标题",
+                file_path="draft.md",
+            )
+            p = _json_payload(r)
+            assert p["skillName"] == "gov_document_layout"
+            assert p["sourceState"] == "model_success"
+            assert "normalizedResult" not in p
+            assert p["resultList"] == {"total": 0, "list": []}
+            combined = _docx_combined_text(p["savePath"])
+            assert "从文件读取的正文" in combined
+
+    asyncio.run(_run())
+
+
+def test_gov_document_layout_main_text_camel_param():
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            set_current_workspace_dir(root)
+            r = await gov_document_layout(
+                title="Camel",
+                content="",
+                mainText="camelCase 字段正文。",
+            )
+            p = _json_payload(r)
+            assert p["sourceState"] == "model_success"
+            assert "normalizedResult" not in p
+            assert p["resultList"]["total"] == 0
+            combined = _docx_combined_text(p["savePath"])
+            assert "camelCase" in combined
+
+    asyncio.run(_run())
+
+
+def test_gov_document_layout_data_json_string():
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            set_current_workspace_dir(root)
+            r = await gov_document_layout(
+                title="JSON",
+                data='{"content": "嵌套 JSON 里的正文。"}',
+            )
+            p = _json_payload(r)
+            assert p["sourceState"] == "model_success"
+            assert "normalizedResult" not in p
+            combined = _docx_combined_text(p["savePath"])
+            assert "嵌套 JSON" in combined
+
+    asyncio.run(_run())
+
+
+def test_gov_document_layout_extra_unknown_long_key():
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            set_current_workspace_dir(root)
+            r = await gov_document_layout(
+                title="T",
+                **{"segmentContent": "这是唯一的长字段内容。"},
+            )
+            p = _json_payload(r)
+            assert p["sourceState"] == "model_success"
+            assert "normalizedResult" not in p
+            combined = _docx_combined_text(p["savePath"])
+            assert "长字段" in combined
+
+    asyncio.run(_run())
+
+
+def test_gov_document_layout_requires_content():
+    async def _run():
+        r = await gov_document_layout(
+            content="",
+            keyword="",
+            text="",
+            document="",
+            body="",
+        )
+        p = _json_payload(r)
+        assert p["normalizedResult"] is None
+        assert p["sourceState"] == "error"
+        assert p["skillName"] == "gov_document_layout"
+
+    asyncio.run(_run())
+
+
+def test_gov_document_layout_body_from_keyword_when_content_empty():
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            set_current_workspace_dir(root)
+            r = await gov_document_layout(
+                title="From Keyword",
+                content="",
+                keyword="仅通过 keyword 传入的正文段落。",
+            )
+            p = _json_payload(r)
+            assert p["skillName"] == "gov_document_layout"
+            assert p["sourceState"] == "model_success"
+            assert "normalizedResult" not in p
+            assert "仅通过 keyword 传入的正文段落" in _docx_combined_text(p["savePath"])
+
+    asyncio.run(_run())
+
+
+def test_gov_document_layout_writes_file():
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            set_current_workspace_dir(root)
+            r = await gov_document_layout(
+                title="Layout Test",
+                content="Paragraph for layout.",
+            )
+            p = _json_payload(r)
+            assert p["skillName"] == "gov_document_layout"
+            assert p["sourceState"] == "model_success"
+            assert p["displayText"] == "已完成：公文排版"
+            assert "normalizedResult" not in p
+            assert p["resultList"] == {"total": 0, "list": []}
+            sp = (p.get("savePath") or "").replace("\\", "/")
+            assert "govdocs" in sp
+            assert sp.lower().endswith(".docx")
+
+    asyncio.run(_run())
+
+
+def test_gov_document_layout_accepts_keyword_kwarg():
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            set_current_workspace_dir(root)
+            r = await gov_document_layout(
+                title="K",
+                content="body",
+                keyword="ui-metadata",
+            )
+            p = _json_payload(r)
+            assert p["skillName"] == "gov_document_layout"
+            assert p["sourceState"] == "model_success"
+            assert "normalizedResult" not in p
+
+    asyncio.run(_run())
+
+
+def test_gov_document_layout_result_list_from_templates_json():
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            set_current_workspace_dir(root)
+            templates = json.dumps(
+                [
+                    {
+                        "id": "7eac05530af3445fa3dccf343e8c4e36",
+                        "templateTitle": "市局党委上行文",
+                        "industryTag": "昆明",
+                        "share": True,
+                        "templateType": "红头",
+                        "layoutContent": "",
+                        "count": 10,
+                    },
+                    {
+                        "id": "a196162515d04870bd4f3b38dc548106",
+                        "templateTitle": "市局党委平行、下行文",
+                        "documentType": "kmdangweixiaxingwen",
+                        "industryTag": "昆明",
+                        "share": True,
+                        "templateType": "红头",
+                        "layoutContent": "",
+                        "count": 9,
+                    },
+                ],
+                ensure_ascii=False,
+            )
+            r = await gov_document_layout(
+                title="示例标题",
+                content="这是一段示例正文内容。",
+                templates=templates,
+            )
+            p = _json_payload(r)
+            assert "normalizedResult" not in p
+            rl = p["resultList"]
+            assert rl["total"] == 2
+            assert len(rl["list"]) == 2
+            assert rl["list"][0]["templateTitle"] == "市局党委上行文"
+            assert rl["list"][1]["documentType"] == "kmdangweixiaxingwen"
+
+    asyncio.run(_run())
+
+
+def test_gov_document_layout_query_only_mocked_fetch():
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            set_current_workspace_dir(Path(td))
+            with patch(
+                "qwenpaw.agents.tools.gov_document_writer.fetch_layout_template_result_list",
+                return_value={"total": 1, "list": [{"id": "1"}]},
+            ) as mock_fetch:
+                r = await gov_document_layout(template_title="上行文")
+            mock_fetch.assert_called_once()
+            p = _json_payload(r)
+            assert p["savePath"] is None
+            assert p["sourceState"] == "model_success"
+            assert p["resultList"]["total"] == 1
+
+    asyncio.run(_run())
+
+
+def test_gov_document_layout_content_and_template_title_uses_fetched_result_list():
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            set_current_workspace_dir(Path(td))
+            with patch(
+                "qwenpaw.agents.tools.gov_document_writer.fetch_layout_template_result_list",
+                return_value={"total": 3, "list": [{"id": "a"}]},
+            ):
+                r = await gov_document_layout(
+                    template_title="党委",
+                    content="正文",
+                    title="T",
+                )
+            p = _json_payload(r)
+            assert p["savePath"]
+            assert p["resultList"]["total"] == 3
+            assert len(p["resultList"]["list"]) == 1
 
     asyncio.run(_run())
 

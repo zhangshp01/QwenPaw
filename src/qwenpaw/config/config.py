@@ -1404,6 +1404,16 @@ def _default_builtin_tools() -> Dict[str, BuiltinToolConfig]:
             ),
             icon="📜",
         ),
+        "gov_document_layout": BuiltinToolConfig(
+            name="gov_document_layout",
+            enabled=True,
+            description=(
+                "Formal / gov-style layout: optional HaiRuo ``layoutTemplate`` when "
+                "``template_title`` is set (config re-read each call); saves ``.docx`` "
+                "under ``govdocs/`` (``gov_document_layout`` / ``gov-document-layout``)"
+            ),
+            icon="📐",
+        ),
         "doc_retrieval": BuiltinToolConfig(
             name="doc_retrieval",
             enabled=True,
@@ -1416,11 +1426,44 @@ def _default_builtin_tools() -> Dict[str, BuiltinToolConfig]:
     }
 
 
+class GovDocumentLayoutHairuoConfig(BaseModel):
+    """HaiRuo ``layoutTemplate`` settings (``config.json`` → ``tools``).
+
+    Only **set** fields override optional JSON from ``GOV_LAYOUT_DEFAULTS``,
+    ``gov_document_layout_defaults.json`` (beside ``config.json``), or
+    ``layout_defaults_path`` on the tool. ``HAIRUOKB_*`` env vars override the merge.
+    """
+
+    base_url: Optional[str] = Field(
+        default=None,
+        description="HaiRuo gateway base URL (e.g. https://host:18085)",
+    )
+    cookie: Optional[str] = Field(
+        default=None,
+        description="Cookie header for HaiRuo requests",
+    )
+    api_key: Optional[str] = Field(
+        default=None,
+        description="Bearer API key when using Authorization instead of Cookie",
+    )
+    verify_ssl: Optional[bool] = Field(
+        default=None,
+        description="Verify TLS certificates (omit to inherit from JSON file)",
+    )
+
+
 class ToolsConfig(BaseModel):
     """Built-in tools management configuration."""
 
     builtin_tools: Dict[str, BuiltinToolConfig] = Field(
         default_factory=_default_builtin_tools,
+    )
+    gov_document_layout_hairuo: GovDocumentLayoutHairuoConfig = Field(
+        default_factory=GovDocumentLayoutHairuoConfig,
+        description=(
+            "HaiRuo layoutTemplate credentials for ``gov_document_layout``; "
+            "overrides optional JSON defaults when fields are set"
+        ),
     )
 
     @model_validator(mode="after")

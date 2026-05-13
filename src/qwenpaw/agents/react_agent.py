@@ -52,6 +52,7 @@ from .tools import (
     grep_search,
     doc_reviewer,
     doc_retrieval,
+    gov_document_layout,
     gov_document_writer,
     list_agents,
     read_file,
@@ -324,6 +325,21 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
             )
             logger.debug(
                 "Registered gov document tools: gov-document-writer, 公文写作",
+            )
+        if enabled_tools.get("gov_document_layout", True):
+            # Tools ``gov_document_layout`` / ``gov-document-layout`` (no gov-document-layout/ config dir).
+            toolkit.register_tool_function(
+                gov_document_layout,
+                namesake_strategy=namesake_strategy,
+                func_name="gov_document_layout",
+            )
+            toolkit.register_tool_function(
+                gov_document_layout,
+                namesake_strategy=namesake_strategy,
+                func_name="gov-document-layout",
+            )
+            logger.debug(
+                "Registered gov layout tools: gov_document_layout, gov-document-layout",
             )
 
         # Knowledge base retrieval (doc-retrieval skill → callable tool)

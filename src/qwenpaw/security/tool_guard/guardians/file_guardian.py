@@ -29,6 +29,23 @@ _TOOL_FILE_PARAMS: dict[str, tuple[str, ...]] = {
     "view_text_file": ("file_path", "path"),
     "write_text_file": ("file_path", "path"),
     "doc_reviewer": ("file_path", "path"),
+    "gov_document_writer": ("file_path", "path", "save_path", "savePath"),
+    "gov-document-writer": ("file_path", "path", "save_path", "savePath"),
+    "公文写作": ("file_path", "path", "save_path", "savePath"),
+    "gov_document_layout": (
+        "file_path",
+        "path",
+        "save_path",
+        "savePath",
+        "layout_defaults_path",
+    ),
+    "gov-document-layout": (
+        "file_path",
+        "path",
+        "save_path",
+        "savePath",
+        "layout_defaults_path",
+    ),
 }
 
 _SECRET_DIR_CURRENT_NAME = ".qwenpaw.secret"
