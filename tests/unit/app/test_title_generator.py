@@ -213,7 +213,7 @@ def _patch_model_factory(
 def _stub_agent_config(
     *,
     enabled: bool = True,
-    timeout_seconds: float = 30.0,
+    timeout_seconds: float = 600.0,
 ) -> MagicMock:
     """Return a stub agent config exposing ``running.auto_title_config``."""
     cfg = MagicMock()

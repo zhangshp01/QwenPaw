@@ -745,12 +745,12 @@ class AutoTitleConfig(BaseModel):
     )
 
     timeout_seconds: float = Field(
-        default=30.0,
+        default=120.0,
         ge=1.0,
         description=(
-            "Hard timeout for the title-generation LLM call. The "
-            "background task is swallowed if this fires, leaving the "
-            "placeholder name in place."
+            "Hard timeout for the title-generation LLM call (streaming "
+            "included). The background task is swallowed if this fires, "
+            "leaving the placeholder name in place."
         ),
     )
 
@@ -1449,6 +1449,26 @@ class GovDocumentLayoutHairuoConfig(BaseModel):
     verify_ssl: Optional[bool] = Field(
         default=None,
         description="Verify TLS certificates (omit to inherit from JSON file)",
+    )
+    recommend_chat_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "OpenAI-compatible ``POST .../v1/chat/completions`` URL for layout "
+            "template ranking (optional); when set, ``fetch_layout_template_result_list`` "
+            "adds a ``recommended`` field"
+        ),
+    )
+    recommend_model: Optional[str] = Field(
+        default=None,
+        description="Chat model id for layout template recommendations",
+    )
+    recommend_api_key: Optional[str] = Field(
+        default=None,
+        description="Bearer token for recommend_chat_url (separate from HaiRuo api_key)",
+    )
+    recommend_verify_ssl: Optional[bool] = Field(
+        default=None,
+        description="TLS verify for recommend_chat_url (omit to use verify_ssl)",
     )
 
 
