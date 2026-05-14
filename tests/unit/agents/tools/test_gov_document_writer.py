@@ -31,13 +31,6 @@ def _json_payload(r):
     return block["json"]
 
 
-def _docx_combined_text(save_path: str) -> str:
-    from docx import Document as DocxDocument
-
-    d = DocxDocument(save_path)
-    return "\n".join(para.text for para in d.paragraphs)
-
-
 def test_doc_reviewer_requires_input():
     async def _run():
         r = await doc_reviewer(content="", file_path="", path="")
@@ -47,7 +40,7 @@ def test_doc_reviewer_requires_input():
         assert p["normalizedResult"] is None
         assert p["displayText"] == "文档审核失败"
         detail = p.get("errorDetail") or ""
-        assert "content" in detail and ("file_path" in detail or "path" in detail)
+        assert "缺少待审阅" in detail or "file_path" in detail
         assert p.get("resultList") is None
 
     asyncio.run(_run())
@@ -87,6 +80,65 @@ def test_doc_reviewer_reads_file():
             assert payload["normalizedResult"]["document"] == "hello-revised"
             fake.assert_awaited_once()
             assert "hello" in (fake.await_args.args[0] or "")
+
+    asyncio.run(_run())
+
+
+def test_doc_reviewer_prefers_normalized_result_over_file():
+    async def _run():
+        fake = AsyncMock(return_value=("revised-from-prior", []))
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            set_current_workspace_dir(root)
+            fp = root / "draft.md"
+            fp.write_text("from-file-body", encoding="utf-8")
+            with patch(_DOC_REVIEW_PATCH, fake):
+                r = await doc_reviewer(
+                    content="",
+                    file_path="draft.md",
+                    normalizedResult={
+                        "document": "prior-step-body\n第二段。",
+                        "source": "model_success",
+                    },
+                )
+            payload = _json_payload(r)
+            assert payload["sourceState"] == "model_success"
+            fake.assert_awaited_once()
+            sent = fake.await_args.args[0] or ""
+            assert "prior-step-body" in sent
+            assert "from-file-body" not in sent
+
+    asyncio.run(_run())
+
+
+def test_doc_reviewer_unwraps_prior_writer_tool_json_array():
+    """Accept AgentLoop-style ``[{type: json, json: {...}}]`` from the writer step."""
+
+    async def _run():
+        fake = AsyncMock(return_value=("定稿", []))
+        blob = json.dumps(
+            [
+                {
+                    "type": "json",
+                    "json": {
+                        "skillName": "gov-document-writer",
+                        "normalizedResult": {
+                            "document": "关于测试的通知\n\n仅一段正文。",
+                            "source": "model_success",
+                        },
+                    },
+                },
+            ],
+            ensure_ascii=False,
+        )
+        with patch(_DOC_REVIEW_PATCH, fake):
+            r = await doc_reviewer(content=blob)
+        payload = _json_payload(r)
+        assert payload["sourceState"] == "model_success"
+        fake.assert_awaited_once()
+        sent = fake.await_args.args[0] or ""
+        assert "关于测试的通知" in sent
+        assert "仅一段正文" in sent
 
     asyncio.run(_run())
 
@@ -190,14 +242,14 @@ def test_gov_document_writer_requires_content():
         assert p["normalizedResult"] is None
         assert p["sourceState"] == "error"
         assert p["retryable"] is True
-        assert p["savePath"] is None
+        assert "savePath" not in p
         assert p["skillName"] == "gov-document-writer"
         assert "content" in (p.get("errorDetail") or "").lower()
 
     asyncio.run(_run())
 
 
-def test_gov_document_writer_writes_file():
+def test_gov_document_writer_returns_json_no_file_no_save_path():
     async def _run():
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -213,108 +265,23 @@ def test_gov_document_writer_writes_file():
             assert p["errorDetail"] is None
             assert p["retryable"] is True
             assert p["stepIndex"] == 1
-            sp = (p.get("savePath") or "").replace("\\", "/")
-            assert "govdocs" in sp
-            assert sp.lower().endswith(".docx")
+            assert "savePath" not in p
             nr = p["normalizedResult"]
             assert nr["source"] == "model_success"
             assert "Body line one." in nr["document"]
             assert "**类型**" not in nr["document"]
             assert "notice" not in nr["document"]
-            docx_files = list((root / "govdocs").glob("Holiday Notice-*.docx"))
-            assert len(docx_files) == 1
-            assert Path(p["savePath"]).resolve() == docx_files[0].resolve()
-            from docx import Document as DocxDocument
-
-            d = DocxDocument(str(docx_files[0]))
-            combined = "\n".join(para.text for para in d.paragraphs)
-            assert "Holiday Notice" in combined
-            assert "Body line one." in combined
-
-    asyncio.run(_run())
-
-
-def test_gov_document_layout_from_file_path_only():
-    async def _run():
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            set_current_workspace_dir(root)
-            (root / "draft.md").write_text("从文件读取的正文。", encoding="utf-8")
-            r = await gov_document_layout(
-                title="文件标题",
-                file_path="draft.md",
+            assert not (root / "govdocs").exists() or not list(
+                (root / "govdocs").glob("*.docx"),
             )
-            p = _json_payload(r)
-            assert p["skillName"] == "gov_document_layout"
-            assert p["sourceState"] == "model_success"
-            assert "normalizedResult" not in p
-            assert "resultList" not in p
-            combined = _docx_combined_text(p["savePath"])
-            assert "从文件读取的正文" in combined
 
     asyncio.run(_run())
 
 
-def test_gov_document_layout_main_text_camel_param():
-    async def _run():
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            set_current_workspace_dir(root)
-            r = await gov_document_layout(
-                title="Camel",
-                content="",
-                mainText="camelCase 字段正文。",
-            )
-            p = _json_payload(r)
-            assert p["sourceState"] == "model_success"
-            assert "normalizedResult" not in p
-            assert "resultList" not in p
-            combined = _docx_combined_text(p["savePath"])
-            assert "camelCase" in combined
-
-    asyncio.run(_run())
-
-
-def test_gov_document_layout_data_json_string():
-    async def _run():
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            set_current_workspace_dir(root)
-            r = await gov_document_layout(
-                title="JSON",
-                data='{"content": "嵌套 JSON 里的正文。"}',
-            )
-            p = _json_payload(r)
-            assert p["sourceState"] == "model_success"
-            assert "normalizedResult" not in p
-            combined = _docx_combined_text(p["savePath"])
-            assert "嵌套 JSON" in combined
-
-    asyncio.run(_run())
-
-
-def test_gov_document_layout_extra_unknown_long_key():
-    async def _run():
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            set_current_workspace_dir(root)
-            r = await gov_document_layout(
-                title="T",
-                **{"segmentContent": "这是唯一的长字段内容。"},
-            )
-            p = _json_payload(r)
-            assert p["sourceState"] == "model_success"
-            assert "normalizedResult" not in p
-            combined = _docx_combined_text(p["savePath"])
-            assert "长字段" in combined
-
-    asyncio.run(_run())
-
-
-def test_gov_document_layout_requires_content():
+def test_gov_document_layout_requires_template_title():
     async def _run():
         r = await gov_document_layout(
-            content="",
+            content="some body",
             keyword="",
             text="",
             document="",
@@ -324,117 +291,16 @@ def test_gov_document_layout_requires_content():
         assert p["normalizedResult"] is None
         assert p["sourceState"] == "error"
         assert p["skillName"] == "gov_document_layout"
+        assert "template_title" in (p.get("errorDetail") or "")
 
     asyncio.run(_run())
 
 
-def test_gov_document_layout_body_from_keyword_when_content_empty():
+def test_gov_document_layout_mocked_fetch_returns_pending_save_path_no_file():
     async def _run():
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             set_current_workspace_dir(root)
-            r = await gov_document_layout(
-                title="From Keyword",
-                content="",
-                keyword="仅通过 keyword 传入的正文段落。",
-            )
-            p = _json_payload(r)
-            assert p["skillName"] == "gov_document_layout"
-            assert p["sourceState"] == "model_success"
-            assert "normalizedResult" not in p
-            assert "仅通过 keyword 传入的正文段落" in _docx_combined_text(p["savePath"])
-
-    asyncio.run(_run())
-
-
-def test_gov_document_layout_writes_file():
-    async def _run():
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            set_current_workspace_dir(root)
-            r = await gov_document_layout(
-                title="Layout Test",
-                content="Paragraph for layout.",
-            )
-            p = _json_payload(r)
-            assert p["skillName"] == "gov_document_layout"
-            assert p["sourceState"] == "model_success"
-            assert p["displayText"] == "已完成：公文排版"
-            assert "normalizedResult" not in p
-            assert "resultList" not in p
-            sp = (p.get("savePath") or "").replace("\\", "/")
-            assert "govdocs" in sp
-            assert sp.lower().endswith(".docx")
-
-    asyncio.run(_run())
-
-
-def test_gov_document_layout_accepts_keyword_kwarg():
-    async def _run():
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            set_current_workspace_dir(root)
-            r = await gov_document_layout(
-                title="K",
-                content="body",
-                keyword="ui-metadata",
-            )
-            p = _json_payload(r)
-            assert p["skillName"] == "gov_document_layout"
-            assert p["sourceState"] == "model_success"
-            assert "normalizedResult" not in p
-
-    asyncio.run(_run())
-
-
-def test_gov_document_layout_result_list_from_templates_json():
-    async def _run():
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            set_current_workspace_dir(root)
-            templates = json.dumps(
-                [
-                    {
-                        "id": "7eac05530af3445fa3dccf343e8c4e36",
-                        "templateTitle": "市局党委上行文",
-                        "industryTag": "昆明",
-                        "share": True,
-                        "templateType": "红头",
-                        "layoutContent": "",
-                        "count": 10,
-                    },
-                    {
-                        "id": "a196162515d04870bd4f3b38dc548106",
-                        "templateTitle": "市局党委平行、下行文",
-                        "documentType": "kmdangweixiaxingwen",
-                        "industryTag": "昆明",
-                        "share": True,
-                        "templateType": "红头",
-                        "layoutContent": "",
-                        "count": 9,
-                    },
-                ],
-                ensure_ascii=False,
-            )
-            r = await gov_document_layout(
-                title="示例标题",
-                content="这是一段示例正文内容。",
-                templates=templates,
-            )
-            p = _json_payload(r)
-            assert "normalizedResult" not in p
-            assert "resultList" not in p
-            combined = _docx_combined_text(p["savePath"])
-            assert "示例标题" in combined
-            assert "示例正文" in combined
-
-    asyncio.run(_run())
-
-
-def test_gov_document_layout_query_only_mocked_fetch():
-    async def _run():
-        with tempfile.TemporaryDirectory() as td:
-            set_current_workspace_dir(Path(td))
             with patch(
                 "qwenpaw.agents.tools.gov_document_writer.fetch_layout_template_result_list",
                 return_value={"templates": [{"id": "1"}]},
@@ -442,9 +308,58 @@ def test_gov_document_layout_query_only_mocked_fetch():
                 r = await gov_document_layout(template_title="上行文")
             mock_fetch.assert_called_once()
             p = _json_payload(r)
-            assert p["savePath"] is None
             assert p["sourceState"] == "model_success"
+            sp = p.get("savePath") or ""
+            assert sp
+            assert sp.lower().endswith(".docx")
+            assert "govdocs" in sp.replace("\\", "/")
+            assert not Path(sp).exists()
             assert "resultList" not in p
+
+    asyncio.run(_run())
+
+
+def test_gov_document_layout_template_title_ignores_body_no_write():
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            set_current_workspace_dir(root)
+            with patch(
+                "qwenpaw.agents.tools.gov_document_writer.fetch_layout_template_result_list",
+                return_value={"templates": [{"id": "a"}]},
+            ):
+                r = await gov_document_layout(
+                    template_title="关于加强数据安全管理的通知",
+                    content="正文不应触发写盘。",
+                    title="IgnoredTitle",
+                )
+            p = _json_payload(r)
+            assert p["sourceState"] == "model_success"
+            sp = p.get("savePath") or ""
+            assert sp and not Path(sp).exists()
+            assert not list((root / "govdocs").glob("*.docx"))
+
+    asyncio.run(_run())
+
+
+def test_gov_document_layout_template_title_bad_file_still_recommends():
+    """``template_title`` alone: missing ``file_path`` file is irrelevant."""
+
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            set_current_workspace_dir(Path(td))
+            with patch(
+                "qwenpaw.agents.tools.gov_document_writer.fetch_layout_template_result_list",
+                return_value={"templates": [{"id": "1", "templateTitle": "T"}]},
+            ):
+                r = await gov_document_layout(
+                    template_title="关于加强数据安全的通知",
+                    file_path="no_such_file_xyz.md",
+                )
+            p = _json_payload(r)
+            assert p["sourceState"] == "model_success"
+            assert p.get("savePath")
+            assert not Path(p["savePath"]).exists()
 
     asyncio.run(_run())
 
@@ -462,25 +377,42 @@ def test_gov_document_layout_client_json_omits_templates_keeps_recommended():
             p = _json_payload(r)
             assert p["resultList"] == {"recommended": rec}
             assert "templates" not in p["resultList"]
+            assert p.get("savePath")
 
     asyncio.run(_run())
 
 
-def test_gov_document_layout_content_and_template_title_uses_fetched_result_list():
+def test_gov_document_layout_explicit_templates_skips_fetch():
     async def _run():
         with tempfile.TemporaryDirectory() as td:
-            set_current_workspace_dir(Path(td))
+            root = Path(td)
+            set_current_workspace_dir(root)
+            templates = json.dumps(
+                [
+                    {
+                        "id": "7eac05530af3445fa3dccf343e8c4e36",
+                        "templateTitle": "市局党委上行文",
+                        "industryTag": "昆明",
+                        "share": True,
+                        "templateType": "红头",
+                        "layoutContent": "",
+                        "count": 10,
+                    },
+                ],
+                ensure_ascii=False,
+            )
             with patch(
                 "qwenpaw.agents.tools.gov_document_writer.fetch_layout_template_result_list",
-                return_value={"templates": [{"id": "a"}]},
-            ):
+            ) as mock_fetch:
                 r = await gov_document_layout(
-                    template_title="党委",
-                    content="正文",
-                    title="T",
+                    template_title="示例标题",
+                    templates=templates,
                 )
+            mock_fetch.assert_not_called()
             p = _json_payload(r)
-            assert p["savePath"]
+            assert p["sourceState"] == "model_success"
+            assert p.get("savePath")
+            assert not Path(p["savePath"]).exists()
             assert "resultList" not in p
 
     asyncio.run(_run())

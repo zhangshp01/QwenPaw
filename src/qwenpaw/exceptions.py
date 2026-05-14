@@ -236,7 +236,7 @@ def convert_model_exception(  # pylint: disable=too-many-return-statements
             "deadline exceeded",
         ]
     ):
-        return ModelTimeoutException(model, timeout=60, details=details)
+        return ModelTimeoutException(model, timeout=600, details=details)
 
     if any(
         kw in error_message

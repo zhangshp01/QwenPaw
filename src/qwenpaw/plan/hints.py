@@ -10,6 +10,9 @@ Differences from AgentScope's DefaultPlanToHint:
 3. Compact plan text — completed subtask outcomes are dropped from the hint
    so per-iteration context cost stays constant.
 4. Properly handles abandoned subtasks in all hint branches.
+5. Optional **gov-document /plan pipeline** — when the runner sets
+   ``_plan_gov_doc_pipeline`` on the notebook, ``create_plan`` is guided to
+   a fixed four-tool sequence and confirmation is skipped (auto-run).
 """
 from __future__ import annotations
 
@@ -153,6 +156,68 @@ _LANG_BLOCK = (
     "recent messages.\n\n"
 )
 
+_GOV_PIPELINE_TOOL_NAMES = (
+    "doc_retrieval",
+    "gov_document_writer",
+    "doc_reviewer",
+    "gov_document_layout",
+)
+
+
+def _gov_pipeline_tool_reminder(subtask_idx: int) -> str:
+    if 0 <= subtask_idx < len(_GOV_PIPELINE_TOOL_NAMES):
+        name = _GOV_PIPELINE_TOOL_NAMES[subtask_idx]
+        return (
+            f"\n**Gov-document pipeline**: this subtask MUST invoke tool "
+            f"`{name}` (exact name).\n"
+        )
+    return ""
+
+
+_GOV_DOC_PIPELINE_NO_PLAN = (
+    "There is no active plan yet.\n"
+    + _LANG_BLOCK
+    + "You are in the **gov-document /plan pipeline** (auto-run; no user "
+    "confirmation step).\n"
+    "Call `create_plan` with **exactly four** subtasks, in order:\n"
+    "1) **Retrieve**: tool `doc_retrieval` — user's topics/query; if the "
+    "result has no items or empty normalized content, continue the pipeline "
+    "with no materials.\n"
+    "2) **Draft**: tool `gov_document_writer` — combine retrieval output "
+    "(e.g. normalizedResult), the user's instructions, and user memory "
+    "files when relevant; response is JSON only (``normalizedResult.document``), "
+    "no ``savePath`` or workspace file.\n"
+    "3) **Review**: tool `doc_reviewer` — pass the prior step's "
+    "``gov-document-writer`` body (``normalizedResult.document`` or the same "
+    "tool JSON / block array); only if that is missing, use ``file_path`` / "
+    "``path``.\n"
+    "4) **Layout**: call `gov_document_layout` **exactly once** per pipeline run "
+    "with **only** ``template_title`` (公文标题). **Do not** pass ``content``, "
+    "``file_path``, or call the tool again: it **only** fetches template "
+    "recommendations, does **not** write a ``.docx``, and returns a non-null "
+    "``savePath`` string as the **pending** output path (same filename pattern as "
+    "before; file may not exist yet).\n"
+    "After `create_plan` succeeds, **do not** ask the user to confirm. "
+    "**Immediately** call `update_subtask_state` with subtask_idx=0 and "
+    "state='in_progress' and begin step 1 (preferably in the same turn).\n"
+)
+
+_GOV_DOC_PIPELINE_AT_START = (
+    "The current plan:\n```\n{plan}\n```\n"
+    + _LANG_BLOCK
+    + "**Gov-document /plan pipeline**: execution is pre-approved. "
+    "Do NOT ask the user to confirm, edit, or wait before starting.\n"
+    "**Immediately** call `update_subtask_state` with subtask_idx=0 and "
+    "state='in_progress', then run tools for that subtask.\n"
+    "If the user's latest message cancels the task, call `finish_plan` with "
+    "state='abandoned'.\n"
+    "If they ask to replace the whole plan, call `finish_plan` (abandoned) "
+    "then `create_plan` again — do not use `revise_current_plan` for a full "
+    "redo before any confirmation flow.\n"
+    "CRITICAL: include at least one tool call this turn — do not reply "
+    "text-only.\n"
+)
+
 if _HAS_DEFAULT_HINT:
 
     class SimplePlanToHint(DefaultPlanToHint):
@@ -245,6 +310,8 @@ if _HAS_DEFAULT_HINT:
         def _hint_no_plan(self, nb) -> str | None:
             """Select hint when there is no active plan."""
             if nb is not None and getattr(nb, "_plan_tool_gate", False):
+                if getattr(nb, "_plan_gov_doc_pipeline", False):
+                    return _GOV_DOC_PIPELINE_NO_PLAN
                 return self.no_plan
             if nb is not None and getattr(
                 nb,
@@ -264,6 +331,10 @@ if _HAS_DEFAULT_HINT:
             )
 
             if n_ip == 0 and n_done == 0 and n_abn == 0:
+                if nb is not None and getattr(nb, "_plan_gov_doc_pipeline", False):
+                    return _GOV_DOC_PIPELINE_AT_START.format(
+                        plan=plan.to_markdown(),
+                    )
                 tmpl = (
                     self.at_the_beginning_after_mutation
                     if just_mutated
@@ -272,12 +343,15 @@ if _HAS_DEFAULT_HINT:
                 return tmpl.format(plan=plan.to_markdown())
 
             if n_ip > 0 and ip_idx is not None:
-                return self.when_a_subtask_in_progress.format(
+                body = self.when_a_subtask_in_progress.format(
                     plan=_compact_plan_text(plan),
                     subtask_idx=ip_idx,
                     subtask_name=plan.subtasks[ip_idx].name,
                     subtask=plan.subtasks[ip_idx].to_markdown(detailed=True),
                 )
+                if nb is not None and getattr(nb, "_plan_gov_doc_pipeline", False):
+                    return body + _gov_pipeline_tool_reminder(ip_idx)
+                return body
 
             if n_done + n_abn == len(plan.subtasks):
                 return self.at_the_end.format(plan=_compact_plan_text(plan))

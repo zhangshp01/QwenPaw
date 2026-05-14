@@ -3,14 +3,16 @@
 
 from .hints import (
     SimplePlanToHint,
-    set_plan_gate,
     check_plan_tool_gate,
+    set_plan_gate,
     should_skip_auto_continue,
 )
+from .gov_doc_pipeline import text_triggers_gov_doc_pipeline
 
 __all__ = [
     "SimplePlanToHint",
-    "set_plan_gate",
     "check_plan_tool_gate",
+    "set_plan_gate",
     "should_skip_auto_continue",
+    "text_triggers_gov_doc_pipeline",
 ]

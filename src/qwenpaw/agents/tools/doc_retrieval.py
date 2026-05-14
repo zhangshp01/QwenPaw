@@ -102,10 +102,9 @@ def _result_body(
     ok: bool,
     error_detail: str | None,
     items: list[dict[str, str]] | None,
-    items_total: int | None,
 ) -> dict[str, Any]:
     if ok:
-        total = items_total if items_total is not None else len(items or [])
+        got = items or []
         return {
             "skillName": _SKILL_NAME_EN,
             "stepIndex": _result_step_index(),
@@ -113,8 +112,8 @@ def _result_body(
             "errorDetail": None,
             "normalizedResult": {
                 "source": _LEGACY_SOURCE_OK,
-                "items": items or [],
-                "itemsTotal": int(total),
+                "items": got,
+                "itemsTotal": len(got),
             },
         }
     return {
@@ -133,20 +132,10 @@ def _json_tool_response(root: dict[str, Any]) -> ToolResponse:
     )
 
 
-def _parse_total(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return None
-
-
-def _result_to_items(result: dict[str, Any]) -> tuple[list[dict[str, str]], int | None]:
+def _result_to_items(result: dict[str, Any]) -> list[dict[str, str]]:
     chunks = result.get("chunks")
     if not isinstance(chunks, list):
-        return [], _parse_total(result.get("total"))
+        return []
     items: list[dict[str, str]] = []
     for ch in chunks:
         if not isinstance(ch, dict):
@@ -154,7 +143,7 @@ def _result_to_items(result: dict[str, Any]) -> tuple[list[dict[str, str]], int 
         title = str(ch.get("document_name") or "unknown").strip() or "unknown"
         desc = _chunk_description(ch)
         items.append({"title": title, "description": desc})
-    return items, _parse_total(result.get("total"))
+    return items
 
 
 async def doc_retrieval(
@@ -186,7 +175,6 @@ async def doc_retrieval(
                 ok=False,
                 error_detail="缺少必填参数 query（检索语句）。",
                 items=None,
-                items_total=None,
             ),
         )
 
@@ -201,7 +189,6 @@ async def doc_retrieval(
                     "请将技能放到工作区 skills/doc-retrieval/ 或工作目录 doc-retrieval/scripts/。"
                 ),
                 items=None,
-                items_total=None,
             ),
         )
 
@@ -213,7 +200,6 @@ async def doc_retrieval(
                 ok=False,
                 error_detail=f"加载知识库检索脚本失败：{e}",
                 items=None,
-                items_total=None,
             ),
         )
 
@@ -267,7 +253,6 @@ async def doc_retrieval(
                 ok=False,
                 error_detail=str(e),
                 items=None,
-                items_total=None,
             ),
         )
 
@@ -277,16 +262,14 @@ async def doc_retrieval(
                 ok=False,
                 error_detail="检索返回了非预期的数据类型。",
                 items=None,
-                items_total=None,
             ),
         )
 
-    items, items_total = _result_to_items(result_dict)
+    items = _result_to_items(result_dict)
     return _json_tool_response(
         _result_body(
             ok=True,
             error_detail=None,
             items=items,
-            items_total=items_total,
         ),
     )

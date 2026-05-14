@@ -2,14 +2,18 @@
 """Formal / gov-style document draft (``gov_document_writer``), layout
 (``gov_document_layout``), and review (``doc_reviewer``) helpers for AgentLoop.
 
-``gov_document_writer``, ``gov_document_layout``, and ``doc_reviewer`` return one
-``{"type": "json", "json": {...}}`` block (``skillName``, ``stepIndex``,
-``displayText``, ``normalizedResult`` (writer / reviewer), ``resultList``
-(layout: optional ``recommended`` only; full template rows are not returned), …) aligned with doc-retrieval
-style envelopes.  ``gov_document_layout`` reports ``skillName`` ``gov_document_layout``;
-it may call HaiRuo ``layoutTemplate`` when ``template_title`` is set (see
-``hairuo_gov_layout``).  Layout success payloads omit ``normalizedResult`` when
-a ``.docx`` is written.
+``gov_document_writer`` returns one ``{"type": "json", "json": {...}}`` block with
+``normalizedResult.document`` (title + body plain text) and **does not** write
+files or emit ``savePath``.
+
+``gov_document_layout`` only recommends templates from HaiRuo using non-empty
+``template_title`` (the 公文标题); it does **not** write ``.docx`` files. Success
+responses include a non-null ``savePath`` string as the **pending** output path
+(same naming rule as before: ``govdocs/{stem}-{timestamp}.docx`` unless
+``savePath`` / ``save_path`` hints an absolute/relative path).
+
+``doc_reviewer`` returns ``normalizedResult`` plus ``resultList``.  Layout
+payloads may include ``recommended`` only (see ``hairuo_gov_layout``).
 """
 
 from __future__ import annotations
@@ -274,6 +278,7 @@ _GOV_EXTRA_VALUE_SKIP_KEYS: frozenset[str] = frozenset(
         "savePath",
         "resultList",
         "templates",
+        "template_title",
     },
 )
 
@@ -393,8 +398,12 @@ def _gov_doc_tool_json(root: dict[str, Any]) -> ToolResponse:
     return ToolResponse(content=[{"type": "json", "json": root}])
 
 
-def _gov_layout_ok_json_no_docx(result_list: dict[str, Any]) -> ToolResponse:
-    """layoutTemplate-only success: no ``.docx``, ``savePath`` is null."""
+def _gov_layout_ok_json_recommend_only(
+    result_list: dict[str, Any],
+    *,
+    pending_save_path: str,
+) -> ToolResponse:
+    """Template recommendation only: no ``.docx`` on disk; ``savePath`` is pending."""
     root: dict[str, Any] = {
         "skillName": _SKILL_NAME_LAYOUT_EN,
         "stepIndex": _writer_step_index(),
@@ -402,12 +411,40 @@ def _gov_layout_ok_json_no_docx(result_list: dict[str, Any]) -> ToolResponse:
         "retryable": True,
         "sourceState": _SOURCE_OK,
         "errorDetail": None,
-        "savePath": None,
+        "savePath": pending_save_path,
     }
     client_rl = _layout_result_list_for_client(result_list)
     if client_rl is not None:
         root["resultList"] = client_rl
     return _gov_doc_tool_json(root)
+
+
+def _gov_layout_heading_for_pending_path(
+    template_title: str,
+    title: str,
+    file_name: str,
+) -> str:
+    """Stem for pending ``.docx`` path (same precedence as layout docx naming)."""
+    heading = (title or "").strip()
+    if not heading and (file_name or "").strip():
+        heading = Path(file_name.strip()).stem
+    if not heading:
+        heading = (template_title or "").strip() or "公文排版稿"
+    return heading
+
+
+def _gov_layout_pending_save_absolute_path(
+    *,
+    template_title: str,
+    title: str,
+    file_name: str,
+    save_path: str,
+    savePath: str,
+) -> str:
+    heading = _gov_layout_heading_for_pending_path(template_title, title, file_name)
+    hint = (savePath or save_path or "").strip()
+    resolved = _resolve_gov_docx_output_path(hint, heading)
+    return str(resolved.resolve())
 
 
 def _gov_doc_tool_error(
@@ -416,18 +453,18 @@ def _gov_doc_tool_error(
     detail: str,
 ) -> ToolResponse:
     detail = (detail or "").strip() or "unknown"
-    return _gov_doc_tool_json(
-        {
-            "skillName": skill_name_en,
-            "stepIndex": _writer_step_index(),
-            "displayText": display_err_zh,
-            "retryable": True,
-            "sourceState": _SOURCE_ERR,
-            "errorDetail": detail,
-            "savePath": None,
-            "normalizedResult": None,
-        },
-    )
+    root: dict[str, Any] = {
+        "skillName": skill_name_en,
+        "stepIndex": _writer_step_index(),
+        "displayText": display_err_zh,
+        "retryable": True,
+        "sourceState": _SOURCE_ERR,
+        "errorDetail": detail,
+        "normalizedResult": None,
+    }
+    if skill_name_en != _SKILL_NAME_EN:
+        root["savePath"] = None
+    return _gov_doc_tool_json(root)
 
 
 def _doc_reviewer_json(root: dict[str, Any]) -> ToolResponse:
@@ -466,6 +503,46 @@ def _doc_reviewer_ok(document: str, result_list: list[dict[str, Any]]) -> ToolRe
             "resultList": result_list,
         },
     )
+
+
+_GOV_WRITER_SKILL_NAMES = frozenset({"gov-document-writer", "gov_document_writer"})
+
+
+def _unwrap_gov_writer_prior_document(raw: Any) -> str:
+    """Return ``normalizedResult.document`` from a prior ``gov-document-writer`` payload."""
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return ""
+        if s.startswith(("{", "[")):
+            try:
+                return _unwrap_gov_writer_prior_document(json.loads(s))
+            except json.JSONDecodeError:
+                return ""
+        return ""
+    if isinstance(raw, dict):
+        if raw.get("type") == "json" and isinstance(raw.get("json"), dict):
+            return _unwrap_gov_writer_prior_document(raw["json"])
+        sk_raw = raw.get("skillName") or raw.get("skill_name")
+        sk = str(sk_raw).strip() if sk_raw is not None else ""
+        if sk == "doc_reviewer":
+            return ""
+        if sk and sk not in _GOV_WRITER_SKILL_NAMES:
+            return ""
+        nr = raw.get("normalizedResult")
+        if isinstance(nr, dict):
+            doc = nr.get("document")
+            if isinstance(doc, str) and doc.strip():
+                return doc.strip()
+        return ""
+    if isinstance(raw, list):
+        for item in raw:
+            got = _unwrap_gov_writer_prior_document(item)
+            if got:
+                return got
+    return ""
 
 
 def _strip_outer_code_fence(text: str) -> str:
@@ -596,28 +673,84 @@ async def _run_document_review_llm(draft: str) -> tuple[str, list[dict[str, Any]
     return _parse_document_review_response(revised or "")
 
 
+def _doc_reviewer_tool_locals_for_merge(
+    content: str,
+    file_path: str,
+    path: str,
+    start_line: int | None,
+    end_line: int | None,
+    extra: dict[str, Any],
+) -> dict[str, Any]:
+    """Build ``locals()``-like dict for :func:`_merge_body_from_tool_locals`."""
+    loc: dict[str, Any] = {k: "" for k in _ALL_BODY_VALUE_KEYS}
+    loc["content"] = content or ""
+    for k in _GOV_INLINE_BODY_KEYS:
+        if k == "content":
+            continue
+        val = extra.get(k)
+        if isinstance(val, str):
+            loc[k] = val
+    data_v = extra.get("data")
+    if isinstance(data_v, str):
+        loc["data"] = data_v
+    elif isinstance(data_v, dict):
+        loc["data"] = json.dumps(data_v, ensure_ascii=False)
+    else:
+        loc["data"] = ""
+    nr = extra.get("normalizedResult")
+    if isinstance(nr, dict):
+        doc = nr.get("document")
+        if isinstance(doc, str) and doc.strip():
+            loc["document"] = doc.strip()
+    loc["file_path"] = file_path
+    loc["path"] = path
+    loc["start_line"] = start_line
+    loc["end_line"] = end_line
+    loc["extra"] = extra
+    return loc
+
+
 async def doc_reviewer(
     content: str = "",
     file_path: str = "",
     path: str = "",
     start_line: int | None = None,
     end_line: int | None = None,
+    **extra: Any,
 ) -> ToolResponse:
     """Inline or file-based draft for review (校对、审阅、定稿).
 
-    Exposed to the model as ``doc_reviewer``. Pass ``content`` and/or
+    Exposed to the model as ``doc_reviewer``. Intended to review **the body
+    produced by the previous ``gov_document_writer`` step** (plain ``content`` /
+    ``document``, ``normalizedResult.document``, or a stringified / block-array
+    tool JSON envelope). If that cannot be resolved, falls back to
     ``file_path`` / ``path`` (same resolution as :func:`read_file`).
 
     Returns a JSON envelope; ``normalizedResult.document`` is the
     **审核修改后正文** (LLM-revised full text). Top-level ``resultList`` holds
     structured change entries (``reason``, ``offsets``, ``errorType``, …).
     """
-    body = (content or "").strip()
+    ex = {k: v for k, v in extra.items()}
+    prior_body = (
+        _unwrap_gov_writer_prior_document(content)
+        or _unwrap_gov_writer_prior_document(ex.get("data"))
+        or _unwrap_gov_writer_prior_document(ex)
+    )
+    content_for_merge = prior_body if prior_body else (content or "")
+    merge_loc = _doc_reviewer_tool_locals_for_merge(
+        content_for_merge,
+        file_path,
+        path,
+        start_line,
+        end_line,
+        ex,
+    )
+    merged = (_merge_body_from_tool_locals(merge_loc) or "").strip()
     max_bytes = get_current_recent_max_bytes() or DEFAULT_MAX_BYTES
-    if body:
-        total_lines = body.count("\n") + (1 if body else 0)
+    if merged:
+        total_lines = merged.count("\n") + (1 if merged else 0)
         draft = truncate_text_output(
-            body,
+            merged,
             start_line=1,
             total_lines=total_lines,
             max_bytes=max_bytes,
@@ -627,8 +760,8 @@ async def doc_reviewer(
         target = (file_path or path or "").strip()
         if not target:
             return _doc_reviewer_error(
-                "错误：缺少待审阅内容。请传入 content（正文），"
-                "或 file_path / path（工作区文稿路径）。",
+                "错误：缺少待审阅内容。请先传入上一步的正文（content / document / "
+                "normalizedResult 等），或提供 file_path / path（工作区文稿路径）。",
             )
         read_resp = await read_file(target, start_line=start_line, end_line=end_line)
         block0 = read_resp.content[0] if read_resp.content else None
@@ -676,8 +809,9 @@ async def _save_gov_style_docx(
     savePath: str = "",
     include_normalized_result: bool = True,
     layout_result_list: dict[str, Any] | None = None,
+    persist_docx: bool = True,
 ) -> ToolResponse:
-    """Shared path: validate input, write ``govdocs/*.docx``, JSON envelope."""
+    """Shared path: validate input, optionally write ``govdocs/*.docx``, JSON envelope."""
     body = (content or "").strip()
     if not body:
         target = (file_path or path or "").strip()
@@ -714,21 +848,6 @@ async def _save_gov_style_docx(
 
     document_plain = f"{heading}\n\n{body}".strip() + "\n"
 
-    out_hint = (savePath or save_path or "").strip()
-    resolved = _resolve_gov_docx_output_path(out_hint, heading)
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        await asyncio.to_thread(
-            _write_gov_docx,
-            resolved,
-            heading,
-            body,
-            type_label=type_label,
-        )
-    except Exception as e:
-        return _gov_doc_tool_error(skill_name_en, display_err_zh, str(e))
-    output_abs = str(resolved.resolve())
     root: dict[str, Any] = {
         "skillName": skill_name_en,
         "stepIndex": _writer_step_index(),
@@ -736,8 +855,24 @@ async def _save_gov_style_docx(
         "retryable": True,
         "sourceState": _SOURCE_OK,
         "errorDetail": None,
-        "savePath": output_abs,
     }
+    if persist_docx:
+        out_hint = (savePath or save_path or "").strip()
+        resolved = _resolve_gov_docx_output_path(out_hint, heading)
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            await asyncio.to_thread(
+                _write_gov_docx,
+                resolved,
+                heading,
+                body,
+                type_label=type_label,
+            )
+        except Exception as e:
+            return _gov_doc_tool_error(skill_name_en, display_err_zh, str(e))
+        root["savePath"] = str(resolved.resolve())
+
     if include_normalized_result:
         root["normalizedResult"] = {
             "document": document_plain,
@@ -785,12 +920,11 @@ async def gov_document_writer(
     savePath: str = "",
     **extra: Any,
 ) -> ToolResponse:
-    """Draft a formal notice-style document and save it under ``govdocs/``.
+    """Draft a formal notice-style document (公文写作).
 
-    Use when the user asks for 公文、通知、公告等正式文稿。Writes a ``.docx`` file
-    named ``{标题}-{时间戳}.docx`` under ``govdocs/`` and returns the JSON envelope
-    (``savePath`` points at the ``.docx``; ``normalizedResult.document`` is
-    plain ``标题 + 正文`` without Markdown or machine ``type`` lines).
+    Does **not** write ``.docx`` files or emit ``savePath``. Returns JSON with
+    ``normalizedResult.document`` as plain ``标题 + 正文`` (no Markdown or machine
+    ``type`` lines).
 
     Body text may arrive under many field names (see module constants), as JSON
     in ``data``, inside nested dicts, in ``**extra``, or only via ``file_path`` /
@@ -815,6 +949,7 @@ async def gov_document_writer(
         savePath=savePath,
         include_normalized_result=True,
         layout_result_list=None,
+        persist_docx=False,
     )
 
 
@@ -835,40 +970,16 @@ def _layout_explicit_nonempty(rl: dict[str, Any]) -> bool:
 
 
 def _template_title_for_layout_fetch(_locals: dict[str, Any]) -> str:
-    t = (
-        (_locals.get("template_title") or _locals.get("templateTitle") or "")
-        .strip()
-    )
+    """HaiRuo 模板检索关键字：``template_title`` 表示**公文标题**（非模板库内部名）。"""
+    t = str(_locals.get("template_title") or "").strip()
     if t:
         return t
     extra_raw = _locals.get("extra")
     if isinstance(extra_raw, dict):
-        for key in ("template_title", "templateTitle"):
-            v = extra_raw.get(key)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
+        v = extra_raw.get("template_title")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
     return ""
-
-
-async def _resolve_gov_layout_merged_body(loc: dict[str, Any]) -> tuple[str, str | None]:
-    """Return ``(body, read_error)`` like the start of ``_save_gov_style_docx``."""
-    merged = _merge_body_from_tool_locals(loc)
-    body = (merged or "").strip()
-    if body:
-        return body, None
-    file_path = str(loc.get("file_path") or "")
-    path = str(loc.get("path") or "")
-    start_line = loc.get("start_line")
-    end_line = loc.get("end_line")
-    target = (file_path or path or "").strip()
-    if not target:
-        return "", None
-    read_resp = await read_file(target, start_line=start_line, end_line=end_line)
-    block0 = read_resp.content[0] if read_resp.content else None
-    draft = _content_block_text(block0) or ""
-    if draft.startswith("Error:"):
-        return "", draft
-    return draft.strip(), None
 
 
 async def gov_document_layout(
@@ -907,35 +1018,33 @@ async def gov_document_layout(
     resultList: Any = None,
     templates: str = "",
     template_title: str = "",
-    templateTitle: str = "",
     layout_page: int = 1,
     layout_page_size: int = 10,
     layout_defaults_path: str = "",
     **extra: Any,
 ) -> ToolResponse:
-    """Format body as a formal ``.docx`` under ``govdocs/`` (公文排版).
+    """公文排版：仅按 ``template_title``（公文标题）推荐 HaiRuo 模板，**不写** ``.docx``。
 
-    **HaiRuo 查模板（可选）**：传入非空 ``template_title`` / ``templateTitle``（或
-    ``**extra`` 中同名键）时，工具在进程内请求 ``layoutTemplate``，每次调用都会
-    重新读取配置（见 ``hairuo_gov_layout``：``config.json``、可选 JSON、环境变量；
-    **不**读取 ``gov-document-layout/`` 工作区目录），便于热更新。仅查模板不传正文时返回 ``savePath: null``；``resultList`` 仅在存在需下发的内容时出现（例如配置了推荐时的 ``recommended``），**不**返回完整模板表字段 ``templates``（亦不含 ``list``/``total``）。
-
-    若同时传入显式 ``resultList`` / ``templates`` 且非空，则优先使用显式列表，
-    否则使用接口返回的列表。成功写 docx 时响应 **不含** ``normalizedResult``。
+    成功时返回非空的 ``savePath``：与原先写盘时相同的**待写入**绝对路径（本步不创建文件）。
+    可传入显式 ``resultList`` / ``templates``（非空时跳过 HaiRuo 请求，仍须 ``template_title``）。
+    不接受 ``templateTitle`` 驼峰键名。正文、``file_path`` 等字段会被忽略。
     """
     loc = {**locals()}
-    merged, read_err = await _resolve_gov_layout_merged_body(loc)
-    if read_err:
+    tt = _template_title_for_layout_fetch(loc)
+    if not tt:
         return _gov_doc_tool_error(
             _SKILL_NAME_LAYOUT_EN,
             _DISPLAY_ERR_LAYOUT_ZH,
-            read_err,
+            "错误：公文排版仅支持按公文标题推荐模板。请传入非空 ``template_title`` "
+            "（公文标题）；本工具不再根据正文写盘。",
         )
-    layout_rl_explicit = _layout_result_list_from_tool_locals(loc)
-    tt = _template_title_for_layout_fetch(loc)
 
+    layout_rl_explicit = _layout_result_list_from_tool_locals(loc)
     fetched_rl: dict[str, Any] | None = None
-    if tt:
+
+    if _layout_explicit_nonempty(layout_rl_explicit):
+        final_rl = layout_rl_explicit
+    else:
         try:
             fetched_rl = await asyncio.to_thread(
                 fetch_layout_template_result_list,
@@ -957,42 +1066,13 @@ async def gov_document_layout(
                 _DISPLAY_ERR_LAYOUT_ZH,
                 str(exc),
             )
+        final_rl = fetched_rl if fetched_rl is not None else layout_rl_explicit
 
-    if _layout_explicit_nonempty(layout_rl_explicit):
-        final_rl = layout_rl_explicit
-    elif fetched_rl is not None:
-        final_rl = fetched_rl
-    else:
-        final_rl = layout_rl_explicit
-
-    if not (merged or "").strip():
-        if fetched_rl is not None:
-            return _gov_layout_ok_json_no_docx(fetched_rl)
-        return _gov_doc_tool_error(
-            _SKILL_NAME_LAYOUT_EN,
-            _DISPLAY_ERR_LAYOUT_ZH,
-            "错误：缺少正文。请提供：任一非空正文字段（如 content、text、document、"
-            "body、markdown、keyword、data 等）、工作区 ``file_path`` / ``path`` 指向"
-            "的文稿文件，或嵌套 JSON / 其它通过 ``**extra`` 传入的字段；"
-            "若仅查询排版模板列表，请传入 ``template_title``。",
-        )
-
-    return await _save_gov_style_docx(
-        skill_name_en=_SKILL_NAME_LAYOUT_EN,
-        display_ok_zh=_DISPLAY_OK_LAYOUT_ZH,
-        display_err_zh=_DISPLAY_ERR_LAYOUT_ZH,
-        content=merged,
+    pending = _gov_layout_pending_save_absolute_path(
+        template_title=tt,
         title=title,
         file_name=file_name,
-        document_type=document_type,
-        machine_type=type,
-        default_heading="公文排版稿",
-        file_path=file_path,
-        path=path,
-        start_line=start_line,
-        end_line=end_line,
         save_path=save_path,
         savePath=savePath,
-        include_normalized_result=False,
-        layout_result_list=final_rl,
     )
+    return _gov_layout_ok_json_recommend_only(final_rl, pending_save_path=pending)

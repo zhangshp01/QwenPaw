@@ -474,6 +474,7 @@ class AgentRunner(Runner):
                         PlanNotebook,
                         InMemoryPlanStorage,
                     )
+                    from ...plan.gov_doc_pipeline import text_triggers_gov_doc_pipeline
                     from ...plan.hints import SimplePlanToHint, set_plan_gate
 
                     hint_gen = SimplePlanToHint()
@@ -488,6 +489,12 @@ class AgentRunner(Runner):
                         plan_desc = query.strip()[6:].strip()
                         if plan_desc:
                             set_plan_gate(plan_notebook, enabled=True)
+                            if text_triggers_gov_doc_pipeline(plan_desc):
+                                setattr(
+                                    plan_notebook,
+                                    "_plan_gov_doc_pipeline",
+                                    True,
+                                )
                             self._rewrite_last_message_text(
                                 msgs,
                                 plan_desc,
@@ -511,7 +518,8 @@ class AgentRunner(Runner):
                         if plan is not None:
                             cur_id = plan.id
                             if not had_plan or cur_id != prev_id:
-                                nb._plan_just_mutated = True
+                                if not getattr(nb, "_plan_gov_doc_pipeline", False):
+                                    nb._plan_just_mutated = True
                             nb._qp_prev_plan_id = cur_id
                         else:
                             if had_plan:
