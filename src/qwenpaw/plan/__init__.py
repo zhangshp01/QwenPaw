@@ -7,7 +7,10 @@ from .hints import (
     set_plan_gate,
     should_skip_auto_continue,
 )
-from .gov_doc_pipeline import text_triggers_gov_doc_pipeline
+from .gov_doc_pipeline import (
+    text_triggers_gov_doc_pipeline,
+    user_brought_gov_doc_materials,
+)
 
 __all__ = [
     "SimplePlanToHint",
@@ -15,4 +18,5 @@ __all__ = [
     "set_plan_gate",
     "should_skip_auto_continue",
     "text_triggers_gov_doc_pipeline",
+    "user_brought_gov_doc_materials",
 ]

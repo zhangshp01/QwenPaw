@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from .command_dispatch import (
     _get_last_user_text,
     _is_command,
+    _last_user_message_has_file_attachment,
     run_command_path,
 )
 from .query_error_dump import write_query_error_dump
@@ -47,6 +48,23 @@ logger = logging.getLogger(__name__)
 
 
 _PRINT_END_SIGNAL = "[END]"
+
+
+def _query_opens_with_skill_tag(query: str | None) -> bool:
+    """True when the first non-empty line is ``[skill:...]`` (AgentLoop skill run).
+
+    In this mode we skip :class:`PlanNotebook` and clear any persisted plan so
+    the model uses tools directly instead of ``create_plan`` / ``/plan``.
+    """
+    if not isinstance(query, str) or not query.strip():
+        return False
+    for raw in query.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        return low.startswith("[skill:") and "]" in line
+    return False
 
 
 async def _cancel_streaming_agent_task(task: asyncio.Task) -> None:
@@ -297,6 +315,7 @@ class AgentRunner(Runner):
             f"msgs={msgs}, request={request}",
         )
         query = _get_last_user_text(msgs)
+        direct_skill_run = _query_opens_with_skill_tag(query)
         session_id = getattr(request, "session_id", "") or ""
 
         # Check if query is a command (including /approval)
@@ -468,13 +487,16 @@ class AgentRunner(Runner):
                 "enabled",
                 False,
             )
-            if plan_enabled:
+            if plan_enabled and not direct_skill_run:
                 try:
                     from agentscope.plan import (
                         PlanNotebook,
                         InMemoryPlanStorage,
                     )
-                    from ...plan.gov_doc_pipeline import text_triggers_gov_doc_pipeline
+                    from ...plan.gov_doc_pipeline import (
+                        text_triggers_gov_doc_pipeline,
+                        user_brought_gov_doc_materials,
+                    )
                     from ...plan.hints import SimplePlanToHint, set_plan_gate
 
                     hint_gen = SimplePlanToHint()
@@ -495,6 +517,18 @@ class AgentRunner(Runner):
                                     "_plan_gov_doc_pipeline",
                                     True,
                                 )
+                                has_files = _last_user_message_has_file_attachment(
+                                    msgs,
+                                )
+                                if user_brought_gov_doc_materials(
+                                    plan_desc,
+                                    has_file_attachment=has_files,
+                                ):
+                                    setattr(
+                                        plan_notebook,
+                                        "_plan_skip_doc_retrieval",
+                                        True,
+                                    )
                             self._rewrite_last_message_text(
                                 msgs,
                                 plan_desc,
@@ -656,6 +690,20 @@ class AgentRunner(Runner):
                     e,
                 )
             session_state_loaded = True
+
+            if direct_skill_run:
+                nb = getattr(agent, "plan_notebook", None)
+                if nb is not None:
+                    try:
+                        nb.load_state_dict(
+                            {"storage": {"plans": {}}, "current_plan": None},
+                            strict=False,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "direct_skill_run: plan notebook reset skipped",
+                            exc_info=True,
+                        )
 
             # Rebuild system prompt so it always reflects the latest
             # AGENTS.md / SOUL.md / PROFILE.md, not the stale one saved

@@ -13,6 +13,7 @@ Reference implementation:
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator
@@ -42,6 +43,11 @@ from ..runner.api import get_chat_manager, get_session, get_workspace
 from ..runner.utils import agentscope_msg_to_message
 from ..runner.models import ChatSpec, ChatUpdate
 from ...providers.provider_manager import ProviderManager
+from ...plan.gov_doc_pipeline import text_triggers_gov_doc_pipeline
+from .agentloop_workflow_sse import (
+    AgentLoopWorkflowSseTransformer,
+    workflow_message_start_sse,
+)
 
 # ---------------------------------------------------------------------------
 # Envelope & request bodies (aligned with govdoc-agent ``app/schemas.py``)
@@ -182,6 +188,36 @@ def _runtime_message_to_govdoc(
     }
 
 
+_PLAN_CMD_PREFIX = "/plan "
+
+
+def _strip_leading_manual_plan_commands(text: str) -> str:
+    """Remove one or more leading ``/plan`` / ``/plan <desc>`` prefixes (any case).
+
+    Used when ``skill`` is set so a literal ``/plan`` in ``content`` cannot open
+    the plan gate; the model should go straight to tools for the given skill.
+    """
+    s = text
+    pat = re.compile(r"^\s*/plan(?:\s+|$)", re.IGNORECASE)
+    while True:
+        m = pat.match(s)
+        if not m:
+            return s
+        s = s[m.end() :].lstrip()
+
+
+def _ensure_leading_plan_command(text: str) -> str:
+    """Ensure runner sees ``/plan <description>`` (``AgentRunner`` gate).
+
+    Uses the same predicate as ``query.strip().lower().startswith("/plan ")``.
+    Applied after skill / continuation lines are merged so ``[skill:…]`` does
+    not hide a leading ``/plan``.
+    """
+    if text.strip().lower().startswith(_PLAN_CMD_PREFIX):
+        return text
+    return f"{_PLAN_CMD_PREFIX}{text}"
+
+
 def _build_run_input_dict(
     body: ConversationRunRequest,
     *,
@@ -201,13 +237,22 @@ def _build_run_input_dict(
                 },
             )
     text = body.content
-    if body.skill:
-        text = f"[skill:{body.skill}]\n{text}"
+    skill_key = (body.skill or "").strip()
+    if skill_key:
+        text = _strip_leading_manual_plan_commands(text)
+    gov_autoplan_probe = _strip_leading_manual_plan_commands(
+        body.content,
+    ).strip()
     if body.resume_from_waiting and (
         body.selected_option or body.prompt_menu_input
     ):
         extra = body.prompt_menu_input or body.selected_option or ""
         text = f"{text}\n[continuation:{extra}]"
+    if skill_key:
+        text = f"[skill:{skill_key}]\n{text}"
+    else:
+        if text_triggers_gov_doc_pipeline(gov_autoplan_probe):
+            text = _ensure_leading_plan_command(text)
     content_blocks[0] = {"type": "text", "text": text}
 
     req: dict[str, Any] = {
@@ -803,9 +848,15 @@ async def stream_conversation_events(
     request: Request,
     conversation_id: str,
     run_id: str | None = Query(default=None),
+    event_format: str = Query(
+        default="workflow",
+        description='SSE payload shape. Use "workflow" for message_start / '
+        "content_block_* / message_stop (Agent 工作流协议). Use \"legacy\" for "
+        "passthrough AgentScope-style JSON (same as historical AgentLoop).",
+    ),
     compact: bool = Query(
         default=True,
-        description="Frontend-friendly stream: drop response in_progress, merge "
+        description="Only for event_format=legacy: drop response in_progress, merge "
         "duplicate tool completed content lines, flatten plugin messages to a "
         "top-level tool field, dedupe tool stream chunks, strip nulls, omit "
         "final response output. Use compact=false for the raw verbose stream.",
@@ -814,8 +865,10 @@ async def stream_conversation_events(
     workspace = await get_agent_for_request(request)
     mgr = workspace.chat_manager
     uid = _resolve_agentloop_user_id(request)
+    conversation_id = conversation_id.strip()
+    rid = run_id.strip() if isinstance(run_id, str) else run_id
     chat = await _get_owned_chat_or_404(mgr, conversation_id, uid)
-    key = run_id or chat.id
+    key = rid or chat.id
     if key != chat.id:
         raise HTTPException(status_code=400, detail="run_id mismatch for this server")
 
@@ -824,25 +877,56 @@ async def stream_conversation_events(
     if queue is None:
         raise HTTPException(status_code=404, detail="暂无运行记录")
 
-    deduper = _AgentLoopSseTerminalDeduper()
-    tool_stream_deduper = _AgentLoopSseToolStreamDeduper()
+    use_legacy = event_format.strip().lower() == "legacy"
 
     async def event_stream() -> AsyncGenerator[str, None]:
         stream_it = tracker.stream_from_queue(queue, chat.id)
+        if use_legacy:
+            deduper = _AgentLoopSseTerminalDeduper()
+            tool_stream_deduper = _AgentLoopSseToolStreamDeduper()
+            try:
+                async for chunk in stream_it:
+                    yield _passthrough_agentloop_sse_chunk(
+                        chunk,
+                        deduper,
+                        tool_stream_deduper,
+                        compact=compact,
+                    )
+            finally:
+                tail = deduper.flush()
+                if tail:
+                    yield "".join(
+                        _emit_agentloop_sse_dict(em, compact=compact)
+                        for em in tail
+                    )
+                await stream_it.aclose()
+            return
+
+        deduper = _AgentLoopSseTerminalDeduper()
+        tool_stream_deduper = _AgentLoopSseToolStreamDeduper()
+        wf = AgentLoopWorkflowSseTransformer()
+        yield workflow_message_start_sse()
         try:
             async for chunk in stream_it:
-                yield _passthrough_agentloop_sse_chunk(
+                passthrough = _passthrough_agentloop_sse_chunk(
                     chunk,
                     deduper,
                     tool_stream_deduper,
-                    compact=compact,
+                    compact=False,
                 )
-        finally:
+                out = wf.consume_passthrough_batch(passthrough)
+                if out:
+                    yield out
             tail = deduper.flush()
             if tail:
-                yield "".join(
-                    _emit_agentloop_sse_dict(em, compact=compact) for em in tail
+                passthrough = "".join(
+                    _emit_agentloop_sse_dict(em, compact=False) for em in tail
                 )
+                out = wf.consume_passthrough_batch(passthrough)
+                if out:
+                    yield out
+        finally:
+            yield wf.finish()
             await stream_it.aclose()
 
     return StreamingResponse(

@@ -49,6 +49,31 @@ def _get_last_user_text(msgs) -> str | None:
     return None
 
 
+def _block_is_file_attachment(block) -> bool:
+    """True if *block* is a file part (dict or AgentScope content object)."""
+    if isinstance(block, dict):
+        return block.get("type") == "file"
+    btype = getattr(block, "type", None)
+    if btype == "file":
+        return True
+    if getattr(btype, "value", None) == "file":
+        return True
+    return type(block).__name__ == "FileContent"
+
+
+def _last_user_message_has_file_attachment(msgs) -> bool:
+    """True if the last user message includes at least one file content block."""
+    if not msgs:
+        return False
+    last = msgs[-1]
+    content = getattr(last, "content", None)
+    if content is None and isinstance(last, dict):
+        content = last.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(_block_is_file_attachment(b) for b in content)
+
+
 def _is_conversation_command(query: str | None) -> bool:
     """True if query is a conversation command (/compact, /new, etc.).
 

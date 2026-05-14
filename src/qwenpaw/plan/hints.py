@@ -12,7 +12,8 @@ Differences from AgentScope's DefaultPlanToHint:
 4. Properly handles abandoned subtasks in all hint branches.
 5. Optional **gov-document /plan pipeline** — when the runner sets
    ``_plan_gov_doc_pipeline`` on the notebook, ``create_plan`` is guided to
-   a fixed four-tool sequence and confirmation is skipped (auto-run).
+   a fixed four-tool sequence and confirmation is skipped (auto-run). When
+   ``_plan_skip_doc_retrieval`` is set, subtask 0 must not use ``doc_retrieval``.
 """
 from __future__ import annotations
 
@@ -164,7 +165,19 @@ _GOV_PIPELINE_TOOL_NAMES = (
 )
 
 
-def _gov_pipeline_tool_reminder(subtask_idx: int) -> str:
+def _gov_pipeline_tool_reminder(subtask_idx: int, plan_notebook) -> str:
+    skip = (
+        plan_notebook is not None
+        and bool(getattr(plan_notebook, "_plan_skip_doc_retrieval", False))
+    )
+    if subtask_idx == 0 and skip:
+        return (
+            "\n**Gov-document pipeline**: this turn already includes user-"
+            "supplied reference materials (files and/or explicit in-message "
+            "sources). **Do NOT** call `doc_retrieval`. Use only the user's "
+            "message and attachments as factual input for drafting; call "
+            "`finish_subtask` with a brief outcome, then continue.\n"
+        )
     if 0 <= subtask_idx < len(_GOV_PIPELINE_TOOL_NAMES):
         name = _GOV_PIPELINE_TOOL_NAMES[subtask_idx]
         return (
@@ -202,6 +215,38 @@ _GOV_DOC_PIPELINE_NO_PLAN = (
     "state='in_progress' and begin step 1 (preferably in the same turn).\n"
 )
 
+_GOV_DOC_PIPELINE_NO_PLAN_SKIP_RETRIEVAL = (
+    "There is no active plan yet.\n"
+    + _LANG_BLOCK
+    + "You are in the **gov-document /plan pipeline** (auto-run; no user "
+    "confirmation step). **User-supplied materials were detected** "
+    "(attachments and/or explicit in-text source cues): **do not** run "
+    "knowledge-base retrieval for materials.\n"
+    "Call `create_plan` with **exactly four** subtasks, in order:\n"
+    "1) **User materials (skip retrieval)**: **Do NOT** call `doc_retrieval`. "
+    "Rely on the user's message and any attached files as the only reference "
+    "inputs; if nothing usable is present despite the flag, proceed with no "
+    "external materials. Call `finish_subtask` with a short outcome.\n"
+    "2) **Draft**: tool `gov_document_writer` — combine the user's provided "
+    "materials, the drafting instructions, and user memory files when "
+    "relevant; response is JSON only (``normalizedResult.document``), "
+    "no ``savePath`` or workspace file.\n"
+    "3) **Review**: tool `doc_reviewer` — pass the prior step's "
+    "``gov-document-writer`` body (``normalizedResult.document`` or the same "
+    "tool JSON / block array); only if that is missing, use ``file_path`` / "
+    "``path``.\n"
+    "4) **Layout**: call `gov_document_layout` **exactly once** per pipeline run "
+    "with **only** ``template_title`` (公文标题). **Do not** pass ``content``, "
+    "``file_path``, or call the tool again: it **only** fetches template "
+    "recommendations, does **not** write a ``.docx``, and returns a non-null "
+    "``savePath`` string as the **pending** output path (same filename pattern as "
+    "before; file may not exist yet).\n"
+    "After `create_plan` succeeds, **do not** ask the user to confirm. "
+    "**Immediately** call `update_subtask_state` with subtask_idx=0 and "
+    "state='in_progress' and begin step 1 without `doc_retrieval` "
+    "(preferably in the same turn).\n"
+)
+
 _GOV_DOC_PIPELINE_AT_START = (
     "The current plan:\n```\n{plan}\n```\n"
     + _LANG_BLOCK
@@ -216,6 +261,12 @@ _GOV_DOC_PIPELINE_AT_START = (
     "redo before any confirmation flow.\n"
     "CRITICAL: include at least one tool call this turn — do not reply "
     "text-only.\n"
+)
+
+_GOV_DOC_PIPELINE_AT_START_SKIP_RETRIEVAL_SUFFIX = (
+    "**Skip-retrieval mode**: subtask 0 must **not** use `doc_retrieval`. "
+    "Use the user's message and attached files only; complete subtask 0 "
+    "(plan tools / `finish_subtask` as needed), then run later steps.\n"
 )
 
 if _HAS_DEFAULT_HINT:
@@ -311,6 +362,8 @@ if _HAS_DEFAULT_HINT:
             """Select hint when there is no active plan."""
             if nb is not None and getattr(nb, "_plan_tool_gate", False):
                 if getattr(nb, "_plan_gov_doc_pipeline", False):
+                    if getattr(nb, "_plan_skip_doc_retrieval", False):
+                        return _GOV_DOC_PIPELINE_NO_PLAN_SKIP_RETRIEVAL
                     return _GOV_DOC_PIPELINE_NO_PLAN
                 return self.no_plan
             if nb is not None and getattr(
@@ -332,9 +385,12 @@ if _HAS_DEFAULT_HINT:
 
             if n_ip == 0 and n_done == 0 and n_abn == 0:
                 if nb is not None and getattr(nb, "_plan_gov_doc_pipeline", False):
-                    return _GOV_DOC_PIPELINE_AT_START.format(
+                    out = _GOV_DOC_PIPELINE_AT_START.format(
                         plan=plan.to_markdown(),
                     )
+                    if getattr(nb, "_plan_skip_doc_retrieval", False):
+                        out += _GOV_DOC_PIPELINE_AT_START_SKIP_RETRIEVAL_SUFFIX
+                    return out
                 tmpl = (
                     self.at_the_beginning_after_mutation
                     if just_mutated
@@ -350,7 +406,7 @@ if _HAS_DEFAULT_HINT:
                     subtask=plan.subtasks[ip_idx].to_markdown(detailed=True),
                 )
                 if nb is not None and getattr(nb, "_plan_gov_doc_pipeline", False):
-                    return body + _gov_pipeline_tool_reminder(ip_idx)
+                    return body + _gov_pipeline_tool_reminder(ip_idx, nb)
                 return body
 
             if n_done + n_abn == len(plan.subtasks):
