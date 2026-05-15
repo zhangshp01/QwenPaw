@@ -43,7 +43,6 @@ from ..runner.api import get_chat_manager, get_session, get_workspace
 from ..runner.utils import agentscope_msg_to_message
 from ..runner.models import ChatSpec, ChatUpdate
 from ...providers.provider_manager import ProviderManager
-from ...plan.gov_doc_pipeline import text_triggers_gov_doc_pipeline
 from .agentloop_workflow_sse import (
     AgentLoopWorkflowSseTransformer,
     workflow_message_start_sse,
@@ -240,9 +239,6 @@ def _build_run_input_dict(
     skill_key = (body.skill or "").strip()
     if skill_key:
         text = _strip_leading_manual_plan_commands(text)
-    gov_autoplan_probe = _strip_leading_manual_plan_commands(
-        body.content,
-    ).strip()
     if body.resume_from_waiting and (
         body.selected_option or body.prompt_menu_input
     ):
@@ -251,8 +247,7 @@ def _build_run_input_dict(
     if skill_key:
         text = f"[skill:{skill_key}]\n{text}"
     else:
-        if text_triggers_gov_doc_pipeline(gov_autoplan_probe):
-            text = _ensure_leading_plan_command(text)
+        text = _ensure_leading_plan_command(text)
     content_blocks[0] = {"type": "text", "text": text}
 
     req: dict[str, Any] = {

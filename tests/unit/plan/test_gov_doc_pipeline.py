@@ -7,30 +7,28 @@ from qwenpaw.plan.gov_doc_pipeline import (
     user_brought_gov_doc_materials,
 )
 
-
-def test_triggers_on_公文():
-    assert text_triggers_gov_doc_pipeline("/plan 编写一篇大数据相关的公文")
+# ``text_triggers_gov_doc_pipeline`` is forced True for all /plan arming.
 
 
-def test_triggers_on_write_plus_doc_type():
-    assert text_triggers_gov_doc_pipeline("写一篇关于加强数据安全的通知")
+def test_pipeline_heuristic_always_true():
+    samples = [
+        "/plan 编写一篇大数据相关的公文",
+        "写一篇关于加强数据安全的通知",
+        (
+            "帮我审核下如下公文：关于加强大数据的指导意见\n\n"
+            "各有关单位：\n……"
+        ),
+        "起草红头文件",
+        "通知我明天下午开会",
+        "关于劳动法的通知条款摘要",
+    ]
+    for s in samples:
+        assert text_triggers_gov_doc_pipeline(s)
 
 
-def test_triggers_on_红头文件():
-    assert text_triggers_gov_doc_pipeline("起草红头文件")
-
-
-def test_no_trigger_notice_only():
-    assert not text_triggers_gov_doc_pipeline("通知我明天下午开会")
-
-
-def test_no_trigger_empty():
-    assert not text_triggers_gov_doc_pipeline("")
-    assert not text_triggers_gov_doc_pipeline("   ")
-
-
-def test_no_trigger_doc_type_without_write():
-    assert not text_triggers_gov_doc_pipeline("关于劳动法的通知条款摘要")
+def test_pipeline_heuristic_empty_or_whitespace_true():
+    assert text_triggers_gov_doc_pipeline("")
+    assert text_triggers_gov_doc_pipeline("   ")
 
 
 def test_user_materials_file_attachment():

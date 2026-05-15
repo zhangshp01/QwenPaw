@@ -15,8 +15,9 @@ from typing import Any, List, Literal, Optional, Type, TYPE_CHECKING
 
 from agentscope.agent import ReActAgent
 from agentscope.agent._react_agent import _MemoryMark
+from agentscope.agent._utils import _AsyncNullContext
 from agentscope.memory import InMemoryMemory
-from agentscope.message import Msg
+from agentscope.message import AudioBlock, Msg, ToolResultBlock
 from agentscope.tool import Toolkit
 from anyio import ClosedResourceError
 from pydantic import BaseModel
@@ -316,31 +317,14 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
             toolkit.register_tool_function(
                 gov_document_writer,
                 namesake_strategy=namesake_strategy,
-                func_name="gov-document-writer",
             )
-            toolkit.register_tool_function(
-                gov_document_writer,
-                namesake_strategy=namesake_strategy,
-                func_name="公文写作",
-            )
-            logger.debug(
-                "Registered gov document tools: gov-document-writer, 公文写作",
-            )
+            logger.debug("Registered tool: gov_document_writer")
         if enabled_tools.get("gov_document_layout", True):
-            # Tools ``gov_document_layout`` / ``gov-document-layout`` (no gov-document-layout/ config dir).
             toolkit.register_tool_function(
                 gov_document_layout,
                 namesake_strategy=namesake_strategy,
-                func_name="gov_document_layout",
             )
-            toolkit.register_tool_function(
-                gov_document_layout,
-                namesake_strategy=namesake_strategy,
-                func_name="gov-document-layout",
-            )
-            logger.debug(
-                "Registered gov layout tools: gov_document_layout, gov-document-layout",
-            )
+            logger.debug("Registered tool: gov_document_layout")
 
         # Knowledge base retrieval (doc-retrieval skill → callable tool)
         if enabled_tools.get("doc_retrieval", True):
@@ -349,17 +333,9 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
             toolkit.register_tool_function(
                 doc_retrieval,
                 namesake_strategy=namesake_strategy,
-                func_name="doc-retrieval",
                 preset_kwargs=_doc_preset,
             )
-            toolkit.register_tool_function(
-                doc_retrieval,
-                namesake_strategy=namesake_strategy,
-                preset_kwargs=_doc_preset,
-            )
-            logger.debug(
-                "Registered knowledge retrieval tools: doc-retrieval, doc_retrieval",
-            )
+            logger.debug("Registered tool: doc_retrieval")
 
         # Auto-register background task management tools if any *enabled*
         # tool has async_execution set
@@ -792,6 +768,122 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
                         except (ValueError, TypeError):
                             pass
 
+    async def _reasoning_llm_pass(
+        self,
+        tool_choice: Literal["auto", "none", "required"] | None = None,
+    ) -> Msg:
+        """Single LLM call step (AgentScope ``ReActAgent._reasoning`` body).
+
+        Plan-notebook hints are merged into the leading **system** message
+        instead of a synthetic **user** turn. Used from the outer
+        ``_reasoning`` (media filtering) and from auto-continue so behavior
+        stays consistent (the outer ``_reasoning`` definition would otherwise
+        shadow an earlier duplicate method in this class).
+        """
+        plan_hint_text = ""
+        if self.plan_notebook:
+            hint_msg = await self.plan_notebook.get_current_hint()
+            if self.print_hint_msg and hint_msg:
+                await self.print(hint_msg)
+            if hint_msg is not None:
+                raw = hint_msg.get_text_content()
+                if raw:
+                    plan_hint_text = raw.strip()
+
+        sys_for_model = (
+            f"{self.sys_prompt}\n\n{plan_hint_text}"
+            if plan_hint_text
+            else self.sys_prompt
+        )
+
+        exclude = (
+            _MemoryMark.COMPRESSED
+            if self.compression_config and self.compression_config.enable
+            else None
+        )
+        prompt = await self.formatter.format(
+            msgs=[
+                Msg("system", sys_for_model, "system"),
+                *await self.memory.get_memory(exclude_mark=exclude),
+            ],
+        )
+        await self.memory.delete_by_mark(mark=_MemoryMark.HINT)
+
+        res = await self.model(
+            prompt,
+            tools=self.toolkit.get_json_schemas(),
+            tool_choice=tool_choice,
+        )
+
+        interrupted_by_user = False
+        msg = None
+
+        tts_context = self.tts_model or _AsyncNullContext()
+        speech: AudioBlock | list[AudioBlock] | None = None
+
+        try:
+            async with tts_context:
+                msg = Msg(name=self.name, content=[], role="assistant")
+                if self.model.stream:
+                    async for content_chunk in res:
+                        msg.invocation_id = content_chunk.id
+                        msg.content = content_chunk.content
+
+                        speech = msg.get_content_blocks("audio") or None
+
+                        if (
+                            self.tts_model
+                            and self.tts_model.supports_streaming_input
+                        ):
+                            tts_res = await self.tts_model.push(msg)
+                            speech = tts_res.content
+
+                        await self.print(msg, False, speech=speech)
+
+                else:
+                    msg.invocation_id = res.id
+                    msg.content = list(res.content)
+
+                if self.tts_model:
+                    tts_res = await self.tts_model.synthesize(msg)
+                    if self.tts_model.stream:
+                        async for tts_chunk in tts_res:
+                            speech = tts_chunk.content
+                            await self.print(msg, False, speech=speech)
+                    else:
+                        speech = tts_res.content
+
+                await self.print(msg, True, speech=speech)
+
+                await asyncio.sleep(0.001)
+
+        except asyncio.CancelledError as e:
+            interrupted_by_user = True
+            raise e from None
+
+        finally:
+            await self.memory.add(msg)
+
+            if interrupted_by_user and msg:
+                tool_use_blocks: list = msg.get_content_blocks("tool_use")
+                for tool_call in tool_use_blocks:
+                    msg_res = Msg(
+                        "system",
+                        [
+                            ToolResultBlock(
+                                type="tool_result",
+                                id=tool_call["id"],
+                                name=tool_call["name"],
+                                output="The tool call has been interrupted "
+                                "by the user.",
+                            ),
+                        ],
+                        "system",
+                    )
+                    await self.memory.add(msg_res)
+                    await self.print(msg_res, True)
+        return msg
+
     async def _acting(self, tool_call) -> dict | None:
         """Check plan tool gate before delegating to ToolGuardMixin."""
         from ..plan.hints import check_plan_tool_gate
@@ -924,7 +1016,9 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
             hint_msg = Msg("user", hint_body, "user")
             await self.memory.add(hint_msg, marks=_MemoryMark.HINT)
             try:
-                next_msg = await super()._reasoning(tool_choice=tool_choice)
+                next_msg = await self._reasoning_llm_pass(
+                    tool_choice=tool_choice,
+                )
             except Exception:
                 logger.warning(
                     "Auto-continue extra _reasoning failed; "
@@ -990,8 +1084,9 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
         3. If the model IS marked as multimodal but still errors on
            media, log a warning about possibly inaccurate capability flag.
 
-        Calls ``super()._reasoning`` to keep the ToolGuardMixin
-        interception active.
+        Delegates the actual model call to ``_reasoning_llm_pass`` (plan
+        hints merged into system; same core as ``ReActAgent._reasoning``).
+        Tool-guard interception remains on ``_acting``.
         """
         # --- Proactive filtering layer ---
         should_strip = (
@@ -1016,7 +1111,7 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
 
         # --- Passive fallback layer (existing logic) ---
         try:
-            msg = await super()._reasoning(tool_choice=tool_choice)
+            msg = await self._reasoning_llm_pass(tool_choice=tool_choice)
         except Exception as e:
             if not self._is_bad_request_or_media_error(e):
                 raise
@@ -1037,7 +1132,9 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
                         "Retrying with request-time media stripping.",
                         e,
                     )
-                    msg = await super()._reasoning(tool_choice=tool_choice)
+                    msg = await self._reasoning_llm_pass(
+                        tool_choice=tool_choice,
+                    )
                     if model_key:
                         get_capability_cache().learn(
                             model_key,
@@ -1065,7 +1162,7 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
                 e,
                 n_stripped,
             )
-            msg = await super()._reasoning(tool_choice=tool_choice)
+            msg = await self._reasoning_llm_pass(tool_choice=tool_choice)
             if model_key:
                 get_capability_cache().learn(
                     model_key,

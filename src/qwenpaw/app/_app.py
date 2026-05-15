@@ -32,7 +32,7 @@ from ..__version__ import __version__
 from ..utils.logging import (
     setup_logger,
     add_project_file_handler,
-    LOG_FILE_PATH,
+    get_log_file_path,
 )
 from ..utils.system_info import summarize_python_environment
 from .auth import AuthMiddleware
@@ -221,7 +221,7 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
     app: FastAPI,
 ):
     startup_start_time = time.time()
-    add_project_file_handler(LOG_FILE_PATH)
+    add_project_file_handler(get_log_file_path())
 
     # ================================================================
     # Phase 1: Fast synchronous setup (target < 100ms)

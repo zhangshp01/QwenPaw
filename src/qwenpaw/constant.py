@@ -177,6 +177,26 @@ MAX_LOAD_HISTORY_COUNT = 10000
 # Env key for app log level (used by CLI and app load for reload child).
 LOG_LEVEL_ENV = "QWENPAW_LOG_LEVEL"
 
+
+def get_log_file_env_override() -> str:
+    """Non-empty path from ``QWENPAW_LOG_FILE`` (``COPAW_LOG_FILE`` fallback)."""
+    return _get_env("QWENPAW_LOG_FILE", "").strip()
+
+# When True, emit INFO logs on logger ``qwenpaw.llm.chat`` with each LLM request
+# and response payload (truncated/redacted). Equivalent detail is emitted at DEBUG
+# when that logger alone is configured to DEBUG without this flag.
+LLM_CHAT_LOG = EnvVarLoader.get_bool(
+    "QWENPAW_LLM_CHAT_LOG",
+    True,
+)
+
+# Maximum UTF-8 length of serialized request/response log lines (~total per log line).
+LLM_CHAT_LOG_MAX_CHARS = EnvVarLoader.get_int(
+    "QWENPAW_LLM_CHAT_LOG_MAX_CHARS",
+    120_000,
+    min_value=2000,
+)
+
 # Env to indicate running inside a container (e.g. Docker). Set to 1/true/yes.
 RUNNING_IN_CONTAINER = EnvVarLoader.get_bool(
     "QWENPAW_RUNNING_IN_CONTAINER",

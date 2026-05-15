@@ -2,9 +2,11 @@
 """Formal / gov-style document draft (``gov_document_writer``), layout
 (``gov_document_layout``), and review (``doc_reviewer``) helpers for AgentLoop.
 
-``gov_document_writer`` returns one ``{"type": "json", "json": {...}}`` block with
-``normalizedResult.document`` (title + body plain text) and **does not** write
-files or emit ``savePath``.
+``gov_document_writer`` exposes a small argument list: ``content`` / ``data``,
+optional ``title``, ``file_name``, ``document_type``, ``type``, workspace
+``file_path`` / ``path`` plus line ranges. Additional body field names
+(``text``, ``body``, ``markdown``, …) are accepted via ``**extra`` and merged
+by the same precedence rules as before.
 
 ``gov_document_layout`` only recommends templates from HaiRuo using non-empty
 ``template_title`` (the 公文标题); it does **not** write ``.docx`` files. Success
@@ -387,11 +389,25 @@ def _merge_gov_inline_body(
 
 
 def _merge_body_from_tool_locals(_locals: dict[str, Any]) -> str:
-    """Build merge dict from a gov tool's ``locals()`` (expects ``extra`` dict)."""
+    """Build merged body from a gov tool's ``locals()`` (``extra`` = ``**extra``)."""
     extra_raw = _locals.get("extra")
-    extra = extra_raw if isinstance(extra_raw, dict) else {}
-    flat = {k: _locals.get(k, "") for k in _ALL_BODY_VALUE_KEYS}
-    return _merge_gov_inline_body(flat, extra)
+    base_extra: dict[str, Any] = (
+        dict(extra_raw) if isinstance(extra_raw, dict) else {}
+    )
+    flat: dict[str, Any] = {}
+    for k in _ALL_BODY_VALUE_KEYS:
+        v = _locals.get(k, "")
+        if isinstance(v, str) and v.strip():
+            flat[k] = v
+            continue
+        ev = base_extra.get(k) if k in base_extra else None
+        if isinstance(ev, str) and ev.strip():
+            flat[k] = ev
+        elif isinstance(v, str):
+            flat[k] = v
+        else:
+            flat[k] = ""
+    return _merge_gov_inline_body(flat, base_extra)
 
 
 def _gov_doc_tool_json(root: dict[str, Any]) -> ToolResponse:
@@ -887,48 +903,25 @@ async def _save_gov_style_docx(
 
 async def gov_document_writer(
     content: str = "",
+    data: str = "",
     title: str = "",
     file_name: str = "",
     document_type: str = "",
     type: str = "",  # noqa: A002  # API / model payload uses key "type"
-    keyword: str = "",
-    text: str = "",
-    document: str = "",
-    body: str = "",
-    markdown: str = "",
-    full_text: str = "",
-    plain_text: str = "",
-    article: str = "",
-    source_text: str = "",
-    message: str = "",
-    draft: str = "",
-    query: str = "",
-    prompt: str = "",
-    input: str = "",  # noqa: A002
-    data: str = "",
-    mainText: str = "",
-    main_text: str = "",
-    plainText: str = "",
-    fullText: str = "",
-    userContent: str = "",
-    sourceText: str = "",
     file_path: str = "",
     path: str = "",
     start_line: int | None = None,
     end_line: int | None = None,
-    save_path: str = "",
-    savePath: str = "",
     **extra: Any,
 ) -> ToolResponse:
     """Draft a formal notice-style document (公文写作).
 
-    Does **not** write ``.docx`` files or emit ``savePath``. Returns JSON with
-    ``normalizedResult.document`` as plain ``标题 + 正文`` (no Markdown or machine
-    ``type`` lines).
+    Does **not** write ``.docx`` or emit ``savePath``. Returns JSON with
+    ``normalizedResult.document`` as plain ``标题 + 正文``.
 
-    Body text may arrive under many field names (see module constants), as JSON
-    in ``data``, inside nested dicts, in ``**extra``, or only via ``file_path`` /
-    ``path`` for a workspace file.
+    Prefer ``content`` or JSON-in-``data``. Other body keys (``text``, ``body``,
+    ``markdown``, ``draft``, …) may be passed as additional keyword arguments;
+    they are merged in the order defined by :data:`_GOV_INLINE_BODY_KEYS`.
     """
     merged = _merge_body_from_tool_locals(locals())
     return await _save_gov_style_docx(
@@ -945,8 +938,8 @@ async def gov_document_writer(
         path=path,
         start_line=start_line,
         end_line=end_line,
-        save_path=save_path,
-        savePath=savePath,
+        save_path="",
+        savePath="",
         include_normalized_result=True,
         layout_result_list=None,
         persist_docx=False,
@@ -983,53 +976,38 @@ def _template_title_for_layout_fetch(_locals: dict[str, Any]) -> str:
 
 
 async def gov_document_layout(
-    content: str = "",
-    title: str = "",
-    file_name: str = "",
-    document_type: str = "",
-    type: str = "",  # noqa: A002
-    keyword: str = "",
-    text: str = "",
-    document: str = "",
-    body: str = "",
-    markdown: str = "",
-    full_text: str = "",
-    plain_text: str = "",
-    article: str = "",
-    source_text: str = "",
-    message: str = "",
-    draft: str = "",
-    query: str = "",
-    prompt: str = "",
-    input: str = "",  # noqa: A002
-    data: str = "",
-    mainText: str = "",
-    main_text: str = "",
-    plainText: str = "",
-    fullText: str = "",
-    userContent: str = "",
-    sourceText: str = "",
-    file_path: str = "",
-    path: str = "",
-    start_line: int | None = None,
-    end_line: int | None = None,
-    save_path: str = "",
-    savePath: str = "",
-    resultList: Any = None,
-    templates: str = "",
     template_title: str = "",
-    layout_page: int = 1,
-    layout_page_size: int = 10,
-    layout_defaults_path: str = "",
     **extra: Any,
 ) -> ToolResponse:
     """公文排版：仅按 ``template_title``（公文标题）推荐 HaiRuo 模板，**不写** ``.docx``。
 
+    对外工具 schema 只暴露 ``template_title``，减少模型误传 ``document`` / ``content`` 等
+    大段正文。分页、显式 ``resultList``、待定 ``savePath`` 等仍可通过 ``**extra`` 传入
+    （若运行时将未知键合并进 ``extra``）；正文类键即使出现在 ``extra`` 内也会被忽略，
+    不参与 HaiRuo 请求。
+
     成功时返回非空的 ``savePath``：与原先写盘时相同的**待写入**绝对路径（本步不创建文件）。
     可传入显式 ``resultList`` / ``templates``（非空时跳过 HaiRuo 请求，仍须 ``template_title``）。
-    不接受 ``templateTitle`` 驼峰键名。正文、``file_path`` 等字段会被忽略。
+    不接受 ``templateTitle`` 驼峰键名（请用 ``template_title``）。
     """
-    loc = {**locals()}
+    ex: dict[str, Any] = dict(extra) if isinstance(extra, dict) else {}
+    tt = (template_title or str(ex.get("template_title") or "")).strip()
+    layout_page = int(ex.get("layout_page", 1) or 1)
+    layout_page_size = int(ex.get("layout_page_size", 10) or 10)
+    layout_defaults_path = str(ex.get("layout_defaults_path") or "").strip()
+    title = str(ex.get("title") or "").strip()
+    file_name = str(ex.get("file_name") or "").strip()
+    save_path = str(ex.get("save_path") or "").strip()
+    savePath = str(ex.get("savePath") or "").strip()
+    resultList = ex.get("resultList")
+    templates = str(ex.get("templates") or "")
+
+    loc: dict[str, Any] = {
+        "template_title": tt,
+        "resultList": resultList,
+        "templates": templates,
+        "extra": ex,
+    }
     tt = _template_title_for_layout_fetch(loc)
     if not tt:
         return _gov_doc_tool_error(

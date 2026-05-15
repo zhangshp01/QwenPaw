@@ -14,7 +14,7 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from starlette.responses import StreamingResponse
 
 from agentscope_runtime.engine.schemas.agent_schemas import AgentRequest
-from ...utils.logging import LOG_FILE_PATH
+from ...utils.logging import get_log_file_path
 from ..agent_context import get_agent_for_request
 from ..runner.title_generator import generate_and_update_title
 
@@ -315,7 +315,7 @@ async def get_backend_debug_logs(
     ),
 ) -> dict:
     """Return the tail of the project log file for the debug UI."""
-    log_path = LOG_FILE_PATH.resolve()
+    log_path = get_log_file_path().resolve()
     try:
         st = log_path.stat()
         return {

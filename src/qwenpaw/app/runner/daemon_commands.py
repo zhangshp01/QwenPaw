@@ -17,7 +17,7 @@ from agentscope.message import Msg, TextBlock
 
 from ...constant import WORKING_DIR
 from ...config import load_config
-from ...utils.logging import LOG_NAMESPACE, LOG_FILE_PATH
+from ...utils.logging import LOG_NAMESPACE, get_log_file_path
 
 if TYPE_CHECKING:
     from ...config.config import AgentProfileConfig
@@ -43,9 +43,6 @@ DAEMON_SHORT_ALIASES = {
     "version": "version",
     "logs": "logs",
 }
-
-LOG_PATH = LOG_FILE_PATH
-
 
 @dataclass
 class DaemonContext:
@@ -179,13 +176,13 @@ def run_daemon_version(context: DaemonContext) -> str:
         f"**Daemon version**\n\n"
         f"- Version: {ver}\n"
         f"- Working dir: {context.working_dir}\n"
-        f"- Log file: {LOG_PATH}"
+        f"- Log file: {get_log_file_path()}"
     )
 
 
 def run_daemon_logs(lines: int = 100) -> str:
     """Tail last N lines from the project log file."""
-    log_path = LOG_PATH
+    log_path = get_log_file_path()
     content = _get_last_lines(log_path, lines=lines)
     return f"**Console log (last {lines} lines)**\n\n```\n{content}\n```"
 

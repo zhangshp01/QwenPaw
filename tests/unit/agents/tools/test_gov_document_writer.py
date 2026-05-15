@@ -278,6 +278,18 @@ def test_gov_document_writer_returns_json_no_file_no_save_path():
     asyncio.run(_run())
 
 
+def test_gov_document_writer_accepts_body_synonyms_in_extra():
+    """Models may still pass ``text`` / ``body`` etc. as overflow kwargs."""
+
+    async def _run():
+        r = await gov_document_writer(title="T", text="Line from text kwarg.")
+        p = _json_payload(r)
+        assert p["sourceState"] == "model_success"
+        assert "Line from text kwarg." in p["normalizedResult"]["document"]
+
+    asyncio.run(_run())
+
+
 def test_gov_document_layout_requires_template_title():
     async def _run():
         r = await gov_document_layout(

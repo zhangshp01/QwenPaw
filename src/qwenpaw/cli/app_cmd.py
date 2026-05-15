@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 
 import click
 import uvicorn
@@ -45,6 +46,15 @@ from ..utils.logging import setup_logger, SuppressPathAccessLogFilter
     help="Path substrings to hide from uvicorn access log (repeatable).",
 )
 @click.option(
+    "--log-file",
+    default=None,
+    type=str,
+    help=(
+        "Append project logs (PlainFormatter) to this path. Relative paths use "
+        "the shell cwd. Overrides QWENPAW_LOG_FILE. Default: WORKING_DIR/qwenpaw.log"
+    ),
+)
+@click.option(
     "--workers",
     type=int,
     default=None,
@@ -59,6 +69,7 @@ def app_cmd(
     workers: int,  # pylint: disable=unused-argument
     log_level: str,
     hide_access_paths: tuple[str, ...],
+    log_file: str | None,
 ) -> None:
     """Run QwenPaw FastAPI app."""
     # Handle deprecated --workers parameter
@@ -81,6 +92,8 @@ def app_cmd(
     else:
         write_last_api(host, port)
     os.environ[LOG_LEVEL_ENV] = log_level
+    if log_file:
+        os.environ["QWENPAW_LOG_FILE"] = str(Path(log_file).expanduser().resolve())
 
     # Signal reload mode to browser_control.py for Windows
     # compatibility: use sync Playwright + ThreadPool only when reload=True

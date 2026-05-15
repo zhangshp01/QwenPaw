@@ -111,11 +111,11 @@ class CommandRegistry:
         Examples:
             # Method 1: Use predefined name
             registry.register_command("/stop", priority="critical")
-            # → level = 0
+            # -> level = 0
 
             # Method 2: Direct number (flexible extension)
             registry.register_command("/emergency", priority_level=5)
-            # → level = 5 (between critical and high)
+            # -> level = 5 (between critical and high)
         """
         # Determine priority level
         if priority_level is not None:
@@ -134,7 +134,7 @@ class CommandRegistry:
         self._command_to_level[prefix_lower] = level
 
         logger.info(
-            f"Registered command: {command_prefix} → level={level}",
+            f"Registered command: {command_prefix} -> level={level}",
         )
 
     def is_control_command(self, query: str) -> bool:
@@ -147,10 +147,10 @@ class CommandRegistry:
             True if query matches any registered command prefix
 
         Examples:
-            is_control_command("/stop") → True
-            is_control_command("/daemon status") → True
-            is_control_command("/stopx") → False (no match)
-            is_control_command("hello") → False
+            is_control_command("/stop") -> True
+            is_control_command("/daemon status") -> True
+            is_control_command("/stopx") -> False (no match)
+            is_control_command("hello") -> False
         """
         if not query or not isinstance(query, str):
             return False
@@ -209,13 +209,13 @@ class CommandRegistry:
                 next_char_idx = len(prefix)
                 if next_char_idx >= len(query_lower):
                     logger.debug(
-                        f"Query '{query[:30]}' → priority_level={level}",
+                        f"Query '{query[:30]}' -> priority_level={level}",
                     )
                     return level
                 next_char = query_lower[next_char_idx]
                 if next_char in (" ", "\t", "\n"):
                     logger.debug(
-                        f"Query '{query[:30]}' → priority_level={level}",
+                        f"Query '{query[:30]}' -> priority_level={level}",
                     )
                     return level
 

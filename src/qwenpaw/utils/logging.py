@@ -7,7 +7,7 @@ import platform
 import sys
 from pathlib import Path
 
-from ..constant import PROJECT_NAME, WORKING_DIR
+from ..constant import PROJECT_NAME, WORKING_DIR, get_log_file_env_override
 
 # Rotating file handler limits (idempotent add avoids duplicate handlers)
 _LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MiB
@@ -28,6 +28,19 @@ LOG_NAMESPACE = PROJECT_NAME.lower()
 # Canonical log file name and path — import these instead of reconstructing.
 LOG_FILE_BASENAME = f"{LOG_NAMESPACE}.log"
 LOG_FILE_PATH = WORKING_DIR / LOG_FILE_BASENAME
+
+
+def get_log_file_path() -> Path:
+    """Path passed to :func:`add_project_file_handler` on app startup.
+
+    When ``QWENPAW_LOG_FILE`` is set (e.g. via ``qwenpaw app --log-file``),
+    returns that path expanded and resolved (relative paths use *process* cwd).
+    Otherwise ``WORKING_DIR / qwenpaw.log``.
+    """
+    raw = get_log_file_env_override()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path(WORKING_DIR) / LOG_FILE_BASENAME
 
 
 def _enable_windows_ansi() -> None:

@@ -52,13 +52,10 @@ from ..constant import (
     WORKING_DIR,
     EnvVarLoader,
 )
-from ..utils.logging import LOG_FILE_BASENAME
+from ..utils.logging import get_log_file_path
 from ..utils.system_info import summarize_python_environment
 from ..providers.provider import Provider
 
-
-# Log file opened on app startup (see ``qwenpaw.app._app`` lifespan).
-APP_LOG_BASENAME = LOG_FILE_BASENAME
 
 # Built-in local llama.cpp provider id; legacy configs may still use
 # copaw-local.
@@ -87,7 +84,7 @@ def _resolve_existing_path_anchor(path: Path) -> Path | None:
 
 def check_app_log_writable() -> tuple[bool, str]:
     """Check log-path writability."""
-    log_path = WORKING_DIR / APP_LOG_BASENAME
+    log_path = get_log_file_path()
     if log_path.exists():
         if not log_path.is_file():
             return (

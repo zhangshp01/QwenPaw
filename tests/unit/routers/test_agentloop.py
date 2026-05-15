@@ -65,7 +65,7 @@ def test_build_run_input_includes_skill_and_model():
     assert block["text"].endswith("hello")
 
 
-def test_build_run_input_prefixes_plan_when_missing():
+def test_build_run_input_prefixes_plan_when_skill_empty():
     chat = ChatSpec(
         id="c1",
         name="t",
@@ -77,11 +77,11 @@ def test_build_run_input_prefixes_plan_when_missing():
     d = _build_run_input_dict(body, chat=chat)
     text = d["input"][0]["content"][0]["text"]
     assert text.startswith("/plan ")
-    assert "写一份通知" in text
+    assert text.endswith("写一份通知")
 
 
-def test_build_run_input_empty_skill_still_prefixes_plan_for_gov():
-    """Whitespace-only skill → treat as no skill; gov-like text still gets /plan."""
+def test_build_run_input_whitespace_skill_treated_as_empty_skill_gets_plan_prefix():
+    """Whitespace-only skill → same as no skill: ``/plan`` prefix."""
     chat = ChatSpec(
         id="c1",
         name="t",
@@ -93,9 +93,10 @@ def test_build_run_input_empty_skill_still_prefixes_plan_for_gov():
     text = _build_run_input_dict(body, chat=chat)["input"][0]["content"][0]["text"]
     assert text.startswith("/plan ")
     assert "[skill:" not in text
+    assert "写一份通知" in text
 
 
-def test_build_run_input_no_auto_plan_for_non_gov_plain_chat():
+def test_build_run_input_plain_chat_gets_plan_prefix_when_no_skill():
     chat = ChatSpec(
         id="c1",
         name="t",
@@ -105,8 +106,8 @@ def test_build_run_input_no_auto_plan_for_non_gov_plain_chat():
     )
     body = ConversationRunRequest(content="hi")
     text = _build_run_input_dict(body, chat=chat)["input"][0]["content"][0]["text"]
-    assert not text.startswith("/plan ")
-    assert text == "hi"
+    assert text.startswith("/plan ")
+    assert text.endswith("hi")
 
 
 def test_build_run_input_skill_strips_manual_plan_prefix():
