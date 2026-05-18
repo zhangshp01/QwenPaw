@@ -281,6 +281,8 @@ def test_workflow_transformer_create_plan_and_retrieval():
         "subtasks": [
             {"name": "资料检索", "description": "检索材料"},
             {"name": "公文写作", "description": "起草正文"},
+            {"name": "审核公文", "description": "审核起草的公文，确保格式正确"},
+            {"name": "推荐版式", "description": "推荐排版"},
         ],
     }
     create_plan_msg = {
@@ -303,14 +305,23 @@ def test_workflow_transformer_create_plan_and_retrieval():
     batch = "data: " + json.dumps(create_plan_msg, ensure_ascii=False) + "\n\n"
     out = wf.consume_passthrough_batch(batch)
     lines = _parse_sse_data_lines(out)
-    assert any(x.get("type") == "content_block_start" for x in lines)
+    starts = [
+        x
+        for x in lines
+        if x.get("type") == "content_block_start"
+        and (x.get("content_block") or {}).get("type") == "tool_use"
+    ]
+    assert starts and starts[0]["content_block"]["skillName"] == "a2a_planning"
     stops = [x for x in lines if x.get("type") == "content_block_stop"]
     assert stops
     plan = stops[0]["payload"]["plan"]
     assert plan["intent"] == "document_workflow"
-    assert len(plan["steps"]) == 2
-    assert plan["steps"][0]["skillName"] == "retrieval"
-    assert plan["steps"][1]["dependsOn"] == ["step_01_retrieval"]
+    assert len(plan["steps"]) == 4
+    assert plan["steps"][0]["skillName"] == "doc_retrieval"
+    assert plan["steps"][1]["skillName"] == "gov_document_writer"
+    assert plan["steps"][2]["skillName"] == "doc_reviewer"
+    assert plan["steps"][3]["skillName"] == "gov_document_layout"
+    assert plan["steps"][1]["dependsOn"] == ["step_01_doc_retrieval"]
 
     retrieval_body = {
         "skillName": "doc-retrieval",
@@ -342,15 +353,270 @@ def test_workflow_transformer_create_plan_and_retrieval():
     batch2 = "data: " + json.dumps(retrieval_msg, ensure_ascii=False) + "\n\n"
     out2 = wf.consume_passthrough_batch(batch2)
     lines2 = _parse_sse_data_lines(out2)
+    tool_starts2 = [
+        x
+        for x in lines2
+        if x.get("type") == "content_block_start"
+        and (x.get("content_block") or {}).get("type") == "tool_use"
+    ]
+    assert len(tool_starts2) == 1
+    assert tool_starts2[0]["content_block"]["skillName"] == "doc_retrieval"
     stop2 = [x for x in lines2 if x.get("type") == "content_block_stop"][-1]
-    assert stop2["payload"]["skillName"] == "retrieval"
+    assert stop2["payload"]["skillName"] == "doc_retrieval"
     assert stop2["payload"]["normalizedResult"]["itemsTotal"] == 1
-    assert stop2["payload"]["result"]["itemsTotal"] == 1
+    assert "result" not in stop2["payload"]
     assert "resultList" not in stop2["payload"]
 
     tail = wf.finish()
     assert "message_stop" in tail
     assert "[DONE]" in tail
+
+
+def test_workflow_tool_emits_tool_use_start_on_in_progress_before_completed():
+    """Long-running tools: first in_progress exposes tool_use start; completed only closes."""
+    wf = AgentLoopWorkflowSseTransformer()
+    cid = "rvp1"
+    in_prog = {
+        "object": "content",
+        "status": "in_progress",
+        "type": "data",
+        "data": {"call_id": cid, "name": "doc_reviewer", "arguments": "{}"},
+    }
+    body = {
+        "skillName": "doc_reviewer",
+        "stepIndex": 3,
+        "displayText": "已完成：文档审核",
+        "normalizedResult": {"document": "正文", "source": "model_success"},
+    }
+    done = {
+        "object": "content",
+        "status": "completed",
+        "type": "data",
+        "data": {
+            "call_id": cid,
+            "name": "doc_reviewer",
+            "output": json.dumps(body, ensure_ascii=False),
+        },
+    }
+    batch = (
+        "data: " + json.dumps(in_prog, ensure_ascii=False) + "\n\n"
+        "data: " + json.dumps(done, ensure_ascii=False) + "\n\n"
+    )
+    out = wf.consume_passthrough_batch(batch)
+    lines = _parse_sse_data_lines(out)
+    tu_starts = [
+        x
+        for x in lines
+        if x.get("type") == "content_block_start"
+        and (x.get("content_block") or {}).get("type") == "tool_use"
+        and (x.get("content_block") or {}).get("skillName") == "doc_reviewer"
+    ]
+    assert len(tu_starts) == 1
+    assert tu_starts[0]["content_block"]["displayText"] == "进行中：doc_reviewer"
+    stops = [
+        x
+        for x in lines
+        if x.get("type") == "content_block_stop"
+        and x.get("payload", {}).get("tool") == "doc_reviewer"
+    ]
+    assert len(stops) == 1
+    assert stops[0]["payload"]["normalizedResult"]["document"] == "正文"
+
+
+def test_workflow_tool_no_second_start_when_completed_call_id_differs_from_in_progress():
+    """Mismatched ``call_id`` on in_progress vs completed must not synthesize another start."""
+    wf = AgentLoopWorkflowSseTransformer()
+    cid_ip = "call_in_progress"
+    cid_done = "call_on_output"
+    in_prog = {
+        "object": "content",
+        "status": "in_progress",
+        "type": "data",
+        "data": {"call_id": cid_ip, "name": "doc_retrieval", "arguments": "{}"},
+    }
+    body = {
+        "skillName": "doc_retrieval",
+        "stepIndex": 3,
+        "displayText": "已完成：知识库文档检索",
+        "normalizedResult": {"items": [], "itemsTotal": 0, "source": "legacy_success"},
+    }
+    done = {
+        "object": "content",
+        "status": "completed",
+        "type": "data",
+        "data": {
+            "call_id": cid_done,
+            "name": "doc_retrieval",
+            "output": json.dumps(body, ensure_ascii=False),
+        },
+    }
+    batch = (
+        "data: " + json.dumps(in_prog, ensure_ascii=False) + "\n\n"
+        "data: " + json.dumps(done, ensure_ascii=False) + "\n\n"
+    )
+    out = wf.consume_passthrough_batch(batch)
+    lines = _parse_sse_data_lines(out)
+    tu_starts = [
+        x
+        for x in lines
+        if x.get("type") == "content_block_start"
+        and (x.get("content_block") or {}).get("type") == "tool_use"
+        and (x.get("content_block") or {}).get("skillName") == "doc_retrieval"
+    ]
+    assert len(tu_starts) == 1
+    stops = [
+        x
+        for x in lines
+        if x.get("type") == "content_block_stop"
+        and x.get("payload", {}).get("tool") == "doc_retrieval"
+    ]
+    assert len(stops) == 1
+
+
+def test_workflow_planning_emits_tool_use_start_on_in_progress_before_completed():
+    wf = AgentLoopWorkflowSseTransformer()
+    plan_obj = {
+        "subtasks": [
+            {"name": "资料检索", "description": "检索材料"},
+        ],
+    }
+    in_prog = {
+        "object": "content",
+        "status": "in_progress",
+        "type": "data",
+        "data": {
+            "call_id": "p1",
+            "name": "create_plan",
+            "arguments": json.dumps(plan_obj, ensure_ascii=False),
+        },
+    }
+    done = {
+        "object": "message",
+        "status": "completed",
+        "type": "plugin_call",
+        "role": "assistant",
+        "content": [
+            {
+                "object": "content",
+                "type": "data",
+                "data": {
+                    "call_id": "p1",
+                    "name": "create_plan",
+                    "arguments": json.dumps(plan_obj, ensure_ascii=False),
+                },
+            },
+        ],
+    }
+    batch = (
+        "data: " + json.dumps(in_prog, ensure_ascii=False) + "\n\n"
+        "data: " + json.dumps(done, ensure_ascii=False) + "\n\n"
+    )
+    out = wf.consume_passthrough_batch(batch)
+    lines = _parse_sse_data_lines(out)
+    plan_starts = [
+        x
+        for x in lines
+        if x.get("type") == "content_block_start"
+        and (x.get("content_block") or {}).get("type") == "tool_use"
+        and (x.get("content_block") or {}).get("skillName") == "a2a_planning"
+    ]
+    assert len(plan_starts) == 1
+    plan_stops = [
+        x
+        for x in lines
+        if x.get("type") == "content_block_stop"
+        and x.get("payload", {}).get("tool") == "a2a_planning"
+    ]
+    assert len(plan_stops) == 1
+
+
+def test_workflow_planning_ignores_late_in_progress_after_completed():
+    """Upstream may replay in_progress after plan completed — no orphan tool_use start."""
+    wf = AgentLoopWorkflowSseTransformer()
+    plan_obj = {"subtasks": [{"name": "检索", "description": "d"}]}
+    cid = "p1"
+    in_prog = {
+        "object": "content",
+        "status": "in_progress",
+        "type": "data",
+        "data": {
+            "call_id": cid,
+            "name": "create_plan",
+            "arguments": json.dumps(plan_obj, ensure_ascii=False),
+        },
+    }
+    done = {
+        "object": "message",
+        "status": "completed",
+        "type": "plugin_call",
+        "role": "assistant",
+        "content": [
+            {
+                "object": "content",
+                "type": "data",
+                "data": {
+                    "call_id": cid,
+                    "name": "create_plan",
+                    "arguments": json.dumps(plan_obj, ensure_ascii=False),
+                },
+            },
+        ],
+    }
+    batch = (
+        "data: " + json.dumps(in_prog, ensure_ascii=False) + "\n\n"
+        "data: " + json.dumps(done, ensure_ascii=False) + "\n\n"
+        "data: " + json.dumps(dict(in_prog), ensure_ascii=False) + "\n\n"
+    )
+    out = wf.consume_passthrough_batch(batch)
+    lines = _parse_sse_data_lines(out)
+    plan_starts = [
+        x
+        for x in lines
+        if x.get("type") == "content_block_start"
+        and (x.get("content_block") or {}).get("type") == "tool_use"
+        and (x.get("content_block") or {}).get("skillName") == "a2a_planning"
+    ]
+    assert len(plan_starts) == 1
+
+
+def test_workflow_tool_ignores_late_in_progress_after_completed():
+    wf = AgentLoopWorkflowSseTransformer()
+    cid = "t1"
+    body = {
+        "skillName": "doc_retrieval",
+        "stepIndex": 1,
+        "displayText": "已完成：知识库文档检索",
+        "normalizedResult": {"items": [], "itemsTotal": 0, "source": "legacy_success"},
+    }
+    done = {
+        "object": "content",
+        "status": "completed",
+        "type": "data",
+        "data": {
+            "call_id": cid,
+            "name": "doc_retrieval",
+            "output": json.dumps(body, ensure_ascii=False),
+        },
+    }
+    late_ip = {
+        "object": "content",
+        "status": "in_progress",
+        "type": "data",
+        "data": {"call_id": cid, "name": "doc_retrieval", "arguments": "{}"},
+    }
+    batch = (
+        "data: " + json.dumps(done, ensure_ascii=False) + "\n\n"
+        "data: " + json.dumps(late_ip, ensure_ascii=False) + "\n\n"
+    )
+    out = wf.consume_passthrough_batch(batch)
+    lines = _parse_sse_data_lines(out)
+    starts = [
+        x
+        for x in lines
+        if x.get("type") == "content_block_start"
+        and (x.get("content_block") or {}).get("skillName") == "doc_retrieval"
+    ]
+    assert len(starts) == 1
 
 
 def test_workflow_transformer_doc_reviewer_merges_result_list():
@@ -404,9 +670,9 @@ def test_workflow_transformer_doc_reviewer_merges_result_list():
     p = stop["payload"]
     assert p["normalizedResult"]["document"] == "标题\n\n正文"
     assert p["normalizedResult"]["resultList"][0]["reason"] == "序号错误"
-    assert p["result"]["document"] == "标题\n\n正文"
-    assert p["result"]["resultList"][0]["errorType"] == "表述问题"
-    assert len(p["resultList"]) == 1
+    assert p["normalizedResult"]["resultList"][0]["errorType"] == "表述问题"
+    assert "result" not in p
+    assert len(p["normalizedResult"]["resultList"]) == 1
 
 
 def test_workflow_transformer_gov_layout_root_result_list_and_save_path():
@@ -419,7 +685,9 @@ def test_workflow_transformer_gov_layout_root_result_list_and_save_path():
         "sourceState": "model_success",
         "errorDetail": None,
         "savePath": "C:\\tmp\\out.docx",
-        "resultList": {"recommended": [{"id": "x", "templateTitle": "市局"}]},
+        "normalizedResult": {
+            "resultList": [{"id": "x", "templateTitle": "市局"}],
+        },
     }
     msg = {
         "object": "message",
@@ -445,11 +713,383 @@ def test_workflow_transformer_gov_layout_root_result_list_and_save_path():
         -1
     ]
     p = stop["payload"]
-    assert p["savePath"] == "C:\\tmp\\out.docx"
     assert p["normalizedResult"]["savePath"] == "C:\\tmp\\out.docx"
-    assert p["result"]["savePath"] == "C:\\tmp\\out.docx"
-    assert p["normalizedResult"]["resultList"]["recommended"][0]["id"] == "x"
-    assert p["result"]["resultList"]["recommended"][0]["templateTitle"] == "市局"
+    assert p["normalizedResult"]["resultList"][0]["id"] == "x"
+    assert p["normalizedResult"]["resultList"][0]["templateTitle"] == "市局"
+    assert "result" not in p
+
+
+def test_workflow_skips_placeholder_doc_reviewer_when_rich_follows():
+    wf = AgentLoopWorkflowSseTransformer()
+    stub = {
+        "skillName": "doc_reviewer",
+        "stepIndex": 0,
+        "displayText": "已完成：doc_reviewer",
+        "normalizedResult": {"source": "model_success"},
+    }
+    rich = {
+        "skillName": "doc_reviewer",
+        "stepIndex": 9,
+        "displayText": "已完成：文档审核",
+        "normalizedResult": {"document": "正文", "source": "model_success"},
+        "resultList": [],
+    }
+    batch = "\n\n".join(
+        [
+            "data: "
+            + json.dumps(
+                {
+                    "object": "message",
+                    "status": "completed",
+                    "type": "plugin_call_output",
+                    "role": "tool",
+                    "content": [
+                        {
+                            "object": "content",
+                            "type": "data",
+                            "data": {
+                                "call_id": "same",
+                                "name": "doc_reviewer",
+                                "output": json.dumps(stub, ensure_ascii=False),
+                            },
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+            "data: "
+            + json.dumps(
+                {
+                    "object": "message",
+                    "status": "completed",
+                    "type": "plugin_call_output",
+                    "role": "tool",
+                    "content": [
+                        {
+                            "object": "content",
+                            "type": "data",
+                            "data": {
+                                "call_id": "same",
+                                "name": "doc_reviewer",
+                                "output": json.dumps(rich, ensure_ascii=False),
+                            },
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+        ]
+    )
+    out = wf.consume_passthrough_batch(batch)
+    stops = [x for x in _parse_sse_data_lines(out) if x.get("type") == "content_block_stop"]
+    doc_stops = [s for s in stops if s.get("payload", {}).get("tool") == "doc_reviewer"]
+    assert len(doc_stops) == 1
+    assert doc_stops[0]["payload"]["normalizedResult"]["document"] == "正文"
+
+
+def test_workflow_drops_orphan_placeholder_gov_writer_after_rich_other_call_id():
+    """Weak writer completion for call_id A stays pending; rich for B must not flush A at ``finish``."""
+    wf = AgentLoopWorkflowSseTransformer()
+    stub = {
+        "skillName": "gov_document_writer",
+        "stepIndex": 0,
+        "displayText": "已完成：gov_document_writer",
+        "normalizedResult": {"source": "model_success"},
+    }
+    rich = {
+        "skillName": "gov_document_writer",
+        "stepIndex": 3,
+        "displayText": "已完成：公文写作",
+        "normalizedResult": {
+            "document": "关于做好地震防范工作的通知\n\n地震防范工作细则与说明段落。",
+            "source": "model_success",
+        },
+    }
+    batch = "\n\n".join(
+        [
+            "data: "
+            + json.dumps(
+                {
+                    "object": "message",
+                    "status": "completed",
+                    "type": "plugin_call_output",
+                    "role": "tool",
+                    "content": [
+                        {
+                            "object": "content",
+                            "type": "data",
+                            "data": {
+                                "call_id": "early",
+                                "name": "gov_document_writer",
+                                "output": json.dumps(stub, ensure_ascii=False),
+                            },
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+            "data: "
+            + json.dumps(
+                {
+                    "object": "message",
+                    "status": "completed",
+                    "type": "plugin_call_output",
+                    "role": "tool",
+                    "content": [
+                        {
+                            "object": "content",
+                            "type": "data",
+                            "data": {
+                                "call_id": "final",
+                                "name": "gov_document_writer",
+                                "output": json.dumps(rich, ensure_ascii=False),
+                            },
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+        ]
+    )
+    out = wf.consume_passthrough_batch(batch) + wf.finish()
+    lines = _parse_sse_data_lines(out)
+    writer_stops = [
+        s
+        for s in lines
+        if s.get("type") == "content_block_stop"
+        and s.get("payload", {}).get("tool") == "gov_document_writer"
+    ]
+    assert len(writer_stops) == 1
+    assert writer_stops[0]["payload"]["normalizedResult"]["document"].startswith(
+        "关于做好地震防范",
+    )
+
+
+def test_workflow_drops_orphan_placeholder_doc_retrieval_after_rich_other_call_id():
+    """Weak doc_retrieval for call_id A stays pending; rich for B must not flush A at ``finish``."""
+    wf = AgentLoopWorkflowSseTransformer()
+    stub = {
+        "skillName": "doc_retrieval",
+        "stepIndex": 0,
+        "displayText": "已完成：doc_retrieval",
+        "normalizedResult": {"source": "model_success"},
+    }
+    rich = {
+        "skillName": "doc_retrieval",
+        "stepIndex": 3,
+        "displayText": "已完成：知识库文档检索",
+        "normalizedResult": {
+            "source": "legacy_success",
+            "items": [],
+            "itemsTotal": 0,
+        },
+    }
+    batch = "\n\n".join(
+        [
+            "data: "
+            + json.dumps(
+                {
+                    "object": "message",
+                    "status": "completed",
+                    "type": "plugin_call_output",
+                    "role": "tool",
+                    "content": [
+                        {
+                            "object": "content",
+                            "type": "data",
+                            "data": {
+                                "call_id": "early",
+                                "name": "doc_retrieval",
+                                "output": json.dumps(stub, ensure_ascii=False),
+                            },
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+            "data: "
+            + json.dumps(
+                {
+                    "object": "message",
+                    "status": "completed",
+                    "type": "plugin_call_output",
+                    "role": "tool",
+                    "content": [
+                        {
+                            "object": "content",
+                            "type": "data",
+                            "data": {
+                                "call_id": "final",
+                                "name": "doc_retrieval",
+                                "output": json.dumps(rich, ensure_ascii=False),
+                            },
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+        ]
+    )
+    out = wf.consume_passthrough_batch(batch) + wf.finish()
+    lines = _parse_sse_data_lines(out)
+    retrieval_stops = [
+        s
+        for s in lines
+        if s.get("type") == "content_block_stop"
+        and s.get("payload", {}).get("tool") == "doc_retrieval"
+    ]
+    assert len(retrieval_stops) == 1
+    assert retrieval_stops[0]["payload"]["stepIndex"] == 3
+    assert retrieval_stops[0]["payload"]["normalizedResult"]["itemsTotal"] == 0
+
+
+def test_workflow_ignores_late_thin_doc_retrieval_after_rich_other_call_id():
+    """Rich completion first; deferrable thin for another call_id must not emit a second stop."""
+    wf = AgentLoopWorkflowSseTransformer()
+    stub = {
+        "skillName": "doc_retrieval",
+        "stepIndex": 0,
+        "displayText": "已完成：doc_retrieval",
+        "normalizedResult": {"source": "model_success"},
+    }
+    rich = {
+        "skillName": "doc_retrieval",
+        "stepIndex": 3,
+        "displayText": "已完成：知识库文档检索",
+        "normalizedResult": {
+            "source": "legacy_success",
+            "items": [],
+            "itemsTotal": 0,
+        },
+    }
+    batch = "\n\n".join(
+        [
+            "data: "
+            + json.dumps(
+                {
+                    "object": "message",
+                    "status": "completed",
+                    "type": "plugin_call_output",
+                    "role": "tool",
+                    "content": [
+                        {
+                            "object": "content",
+                            "type": "data",
+                            "data": {
+                                "call_id": "final",
+                                "name": "doc_retrieval",
+                                "output": json.dumps(rich, ensure_ascii=False),
+                            },
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+            "data: "
+            + json.dumps(
+                {
+                    "object": "message",
+                    "status": "completed",
+                    "type": "plugin_call_output",
+                    "role": "tool",
+                    "content": [
+                        {
+                            "object": "content",
+                            "type": "data",
+                            "data": {
+                                "call_id": "early",
+                                "name": "doc_retrieval",
+                                "output": json.dumps(stub, ensure_ascii=False),
+                            },
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+        ]
+    )
+    out = wf.consume_passthrough_batch(batch) + wf.finish()
+    lines = _parse_sse_data_lines(out)
+    retrieval_stops = [
+        s
+        for s in lines
+        if s.get("type") == "content_block_stop"
+        and s.get("payload", {}).get("tool") == "doc_retrieval"
+    ]
+    assert len(retrieval_stops) == 1
+
+
+def test_workflow_skips_empty_plan_after_nonempty():
+    """Second upstream plan completion with 0 subtasks is suppressed after a real plan."""
+    wf = AgentLoopWorkflowSseTransformer()
+    full = {"subtasks": [{"name": "检索", "description": "d"}]}
+    empty = {"subtasks": []}
+    batch = "\n\n".join(
+        [
+            "data: "
+            + json.dumps(
+                {
+                    "object": "message",
+                    "status": "completed",
+                    "type": "plugin_call",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "object": "content",
+                            "type": "data",
+                            "data": {
+                                "call_id": "p1",
+                                "name": "create_plan",
+                                "arguments": json.dumps(full, ensure_ascii=False),
+                            },
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+            "data: "
+            + json.dumps(
+                {
+                    "object": "message",
+                    "status": "completed",
+                    "type": "plugin_call",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "object": "content",
+                            "type": "data",
+                            "data": {
+                                "call_id": "p2",
+                                "name": "revise_current_plan",
+                                "arguments": json.dumps(empty, ensure_ascii=False),
+                            },
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+        ]
+    )
+    out = wf.consume_passthrough_batch(batch)
+    lines = _parse_sse_data_lines(out)
+    plan_stops = [
+        x
+        for x in lines
+        if x.get("type") == "content_block_stop"
+        and x.get("payload", {}).get("tool") == "a2a_planning"
+    ]
+    assert len(plan_stops) == 1
+    assert plan_stops[0]["payload"]["steps"] == 1
 
 
 def test_tool_result_root_accepts_content_json_block():
@@ -458,3 +1098,39 @@ def test_tool_result_root_accepts_content_json_block():
     inner = {"skillName": "doc_reviewer", "sourceState": "ok", "stepIndex": 1}
     wrapped = {"content": [{"type": "json", "json": inner}]}
     assert _tool_result_root(wrapped) == inner
+
+
+def test_workflow_text_completed_without_in_progress_pairs_start_delta_stop():
+    """Upstream may omit text ``in_progress``; emit ``content_block_start`` before deltas."""
+    wf = AgentLoopWorkflowSseTransformer()
+    msg = {
+        "object": "content",
+        "type": "text",
+        "status": "completed",
+        "text": "仅此一句",
+    }
+    out = wf.consume_passthrough_batch(
+        "data: " + json.dumps(msg, ensure_ascii=False) + "\n\n",
+    )
+    lines = _parse_sse_data_lines(out)
+    types = [x.get("type") for x in lines]
+    assert types == ["content_block_start", "content_block_delta", "content_block_stop"]
+    assert lines[0]["content_block"]["type"] == "text"
+    assert lines[1]["delta"]["text"] == "仅此一句"
+    assert lines[2]["payload"]["tool"] == "assistant"
+
+
+def test_workflow_passthrough_error_emits_tool_use_start_then_stop():
+    wf = AgentLoopWorkflowSseTransformer()
+    err_obj = {"error": "boom"}
+    out = wf.consume_passthrough_batch(
+        "data: " + json.dumps(err_obj, ensure_ascii=False) + "\n\n",
+    )
+    lines = _parse_sse_data_lines(out)
+    assert len(lines) >= 2
+    assert lines[0]["type"] == "content_block_start"
+    assert lines[0]["content_block"]["type"] == "tool_use"
+    assert lines[0]["content_block"]["skillName"] == "error"
+    assert lines[1]["type"] == "content_block_stop"
+    assert lines[1]["payload"]["sourceState"] == "error"
+    assert lines[1]["payload"]["errorDetail"] == "boom"

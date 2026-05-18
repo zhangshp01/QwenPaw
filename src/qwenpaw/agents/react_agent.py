@@ -45,7 +45,7 @@ from .tools import (
     check_agent_task,
     submit_to_agent,
     desktop_screenshot,
-    edit_file,
+    # edit_file,
     execute_shell_command,
     get_current_time,
     get_token_usage,
@@ -56,12 +56,12 @@ from .tools import (
     gov_document_layout,
     gov_document_writer,
     list_agents,
-    read_file,
+    # read_file,
     send_file_to_user,
     set_user_timezone,
     view_image,
     view_video,
-    write_file,
+    # write_file,
 )
 from .utils import process_file_and_media_blocks_in_message
 from ..constant import (
@@ -264,9 +264,9 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
         # Map of tool functions
         tool_functions = {
             "execute_shell_command": execute_shell_command,
-            "read_file": read_file,
-            "write_file": write_file,
-            "edit_file": edit_file,
+            # "read_file": read_file,
+            # "write_file": write_file,
+            # "edit_file": edit_file,
             "grep_search": grep_search,
             "glob_search": glob_search,
             "browser_use": browser_use,
@@ -884,9 +884,56 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
                     await self.print(msg_res, True)
         return msg
 
+    def _mark_plan_gate_phantom_tools_for_chat_history(
+        self,
+        tool_call: dict,
+    ) -> None:
+        """Tag the assistant Msg that owns *tool_call* so chat history skips it.
+
+        ``print()`` already omits SSE for plan-gated tool_use; persisted memory
+        still holds the paired assistant/tool-result rows. Consumers like
+        ``GET /chats/{id}`` rebuild messages via ``agentscope_msg_to_message`` —
+        honour :data:`qp_hide_plan_gate_tool_ids` there.
+        """
+        from ..plan.hints import PLAN_GATE_UI_HIDE_TOOL_IDS_KEY
+
+        call_id = tool_call.get("id")
+        if not call_id:
+            return
+        mem = getattr(self.memory, "content", None)
+        if not mem:
+            return
+        for msg, _marks in reversed(mem):
+            if getattr(msg, "role", None) != "assistant":
+                continue
+            content = getattr(msg, "content", None)
+            if not isinstance(content, list):
+                continue
+            owns = False
+            for blk in content:
+                if (
+                    isinstance(blk, dict)
+                    and blk.get("type") == "tool_use"
+                    and blk.get("id") == call_id
+                ):
+                    owns = True
+                    break
+            if not owns:
+                continue
+            md = msg.metadata
+            raw = md.get(PLAN_GATE_UI_HIDE_TOOL_IDS_KEY)
+            hidden = list(raw) if isinstance(raw, list) else []
+            if call_id not in hidden:
+                hidden.append(call_id)
+            md[PLAN_GATE_UI_HIDE_TOOL_IDS_KEY] = hidden
+            return
+
     async def _acting(self, tool_call) -> dict | None:
         """Check plan tool gate before delegating to ToolGuardMixin."""
-        from ..plan.hints import check_plan_tool_gate
+        from ..plan.hints import (
+            PLAN_GATE_UI_HIDE_DENIED_TOOL_RESULT_KEY,
+            check_plan_tool_gate,
+        )
 
         tool_name = str(tool_call.get("name", ""))
 
@@ -899,6 +946,10 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
             if err:
                 from agentscope.message import ToolResultBlock
 
+                self._mark_plan_gate_phantom_tools_for_chat_history(
+                    tool_call,
+                )
+
                 tool_res_msg = Msg(
                     "system",
                     [
@@ -910,8 +961,8 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
                         ),
                     ],
                     "system",
+                    metadata={PLAN_GATE_UI_HIDE_DENIED_TOOL_RESULT_KEY: True},
                 )
-                await self.print(tool_res_msg, True)
                 await self.memory.add(tool_res_msg)
                 return None
 
@@ -1290,6 +1341,11 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
         message queue, preventing the frontend from briefly rendering
         phantom tool calls that will never be executed.
 
+        Outside summarizing: while the ``/plan`` gate is pending, strip
+        disallowed assistant ``tool_use`` blocks before they reach the
+        SSE/console consumers; the gated tool still resolves in-memory
+        (synthetic ``tool_result``, no ``plugin_call_output`` emission).
+
         On the *final* streaming event (``last=True``), append the
         round-end notice so users see it immediately instead of only
         after a page refresh.  Intermediate events that become empty
@@ -1297,6 +1353,30 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
         """
 
         if not getattr(self, "_in_summarizing", False):
+            nb = getattr(self, "plan_notebook", None)
+            if getattr(msg, "role", None) == "assistant" and nb is not None:
+                from ..plan.hints import (
+                    filter_plan_gate_blocked_tool_calls_for_stream,
+                )
+
+                if isinstance(msg.content, list):
+                    filtered = filter_plan_gate_blocked_tool_calls_for_stream(
+                        nb,
+                        msg.content,
+                    )
+                    if filtered is not None:
+                        if not filtered:
+                            return
+                        original = msg.content
+                        msg.content = filtered
+                        try:
+                            return await super().print(
+                                msg,
+                                last,
+                                speech=speech,
+                            )
+                        finally:
+                            msg.content = original
             return await super().print(msg, last, speech=speech)
 
         original = msg.content

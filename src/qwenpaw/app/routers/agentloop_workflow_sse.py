@@ -2,8 +2,32 @@
 """Map AgentScope console SSE payloads to the AgentLoop workflow protocol.
 
 Protocol summary (SSE ``text/event-stream``):
-``message_start`` → ``content_block_*`` (planning + sub-agents) →
-``message_stop`` → ``[DONE]``.
+After ``message_start``, emit **paired** blocks only: each unit is
+``content_block_start`` → optional ``content_block_delta`` (assistant ``type:
+text`` streams deltas inside that single block) → ``content_block_stop``, then
+the next block's ``content_block_start``, and so on. Close the assistant text
+block before opening a ``tool_use`` block; finish each ``tool_use`` with
+``content_block_stop`` before resuming assistant text. End with ``message_stop``
+→ ``[DONE]``.
+
+Whenever upstream sends ``status: in_progress`` for a tool/plan row, emit
+``content_block_start`` (``tool_use``) so sub-agents / long steps are visible early;
+``content_block_stop`` still carries the payload. If only ``completed`` is seen, start
+and stop are emitted back-to-back as before. The workflow SSE uses ``compact=false`` passthrough so ``content``/``data`` tool **completed**
+rows (with full ``output``) are not stripped before mapping. Identical repeat
+completions are dropped by a content fingerprint. Shallow scaffold completions
+(same ``call_id``, trivial JSON) may be deferred until a fuller completion
+arrives or the stream ends. Empty plan completions are skipped once a non-empty
+plan has been sent in the same run. After ``content_block_stop`` for a given
+``(tool name, call_id)``, further ``in_progress`` rows for that key are ignored
+to avoid duplicate orphan ``content_block_start`` lines from upstream reordering.
+Stale deferred placeholders for the same tool name are dropped at stream end when
+a substantive completion for that tool was already emitted (different ``call_id``).
+Deferrable completions are also skipped when registering pending state if a
+substantial completion for that tool name was already emitted (handles thin rows
+that arrive after the rich one). At assistant paragraph completion and at stream
+terminal, pending tool placeholders are flushed before the assistant text block is
+closed so tool ``content_block_stop`` lines do not appear after the assistant summary.
 """
 
 from __future__ import annotations
@@ -22,19 +46,10 @@ _SKIP_WORKFLOW_TOOL_NAMES = frozenset(
 
 _PLANNING_TOOL_NAMES = frozenset({"create_plan", "revise_current_plan"})
 
-# Map internal tool names to protocol ``skillName`` / ``tool`` short ids.
-_PROTOCOL_SKILL_BY_TOOL: dict[str, str] = {
-    "create_plan": "a2a_planning",
-    "revise_current_plan": "a2a_planning",
-    "doc_retrieval": "retrieval",
-    "gov_document_writer": "writing",
-    "doc_reviewer": "doc_reviewer",
-    "gov_document_layout": "gov_document_layout",
-}
-
+# Default ``skillName`` for inferred gov-doc pipeline steps (positional fallback).
 _GOV_ORDER_SKILLS: tuple[str, ...] = (
-    "retrieval",
-    "writing",
+    "doc_retrieval",
+    "gov_document_writer",
     "doc_reviewer",
     "gov_document_layout",
 )
@@ -172,6 +187,93 @@ def _tool_result_root(output: Any) -> dict[str, Any] | None:
     return None
 
 
+def _completion_fingerprint(row: dict[str, Any]) -> str:
+    """Stable string for deduping duplicate SSE envelopes (same tool + same body)."""
+    name = row.get("name")
+    if name in _PLANNING_TOOL_NAMES:
+        raw = row.get("arguments")
+        if isinstance(raw, str):
+            return raw
+        try:
+            return json.dumps(raw, sort_keys=True, default=str)
+        except TypeError:
+            return str(raw)
+    out = row.get("output")
+    root = _tool_result_root(out)
+    if root is not None:
+        try:
+            return json.dumps(root, sort_keys=True, ensure_ascii=False)
+        except TypeError:
+            return str(root)
+    if out is None:
+        return ""
+    if isinstance(out, str):
+        return out
+    try:
+        return json.dumps(out, sort_keys=True, default=str)
+    except TypeError:
+        return str(out)
+
+
+def _tool_payload_richness(root: dict[str, Any] | None) -> int:
+    """Heuristic size score for tool JSON (higher => real payload, not scaffold)."""
+    if not isinstance(root, dict):
+        return 0
+    score = 0
+    for k in ("document", "items", "savePath"):
+        v = root.get(k)
+        if v is None:
+            continue
+        if k == "document" and isinstance(v, str) and v.strip():
+            score += min(len(v), 20_000)
+        elif k == "items" and isinstance(v, list) and len(v) > 0:
+            score += 500 + 50 * len(v)
+        elif k == "savePath" and isinstance(v, str) and v.strip():
+            score += 1000
+    nr = root.get("normalizedResult")
+    if isinstance(nr, dict):
+        for k in ("document", "items", "resultList", "templates"):
+            v = nr.get(k)
+            if v is None or v == [] or v == {}:
+                continue
+            if k == "document" and isinstance(v, str) and v.strip():
+                score += min(len(v), 20_000)
+            elif k == "items" and isinstance(v, list) and len(v) > 0:
+                score += 500 + 50 * len(v)
+            elif k in ("resultList", "templates"):
+                if isinstance(v, list) and len(v) > 0:
+                    score += 300 + 30 * len(v)
+                elif isinstance(v, dict) and v:
+                    score += 200
+    rl = root.get("resultList")
+    if isinstance(rl, list) and len(rl) > 0:
+        score += 300 + 30 * len(rl)
+    elif isinstance(rl, dict) and rl:
+        score += 200
+    return score
+
+
+def _is_deferrable_placeholder_tool(name: str, root: dict[str, Any] | None) -> bool:
+    """Hold this completion if a fuller ``plugin_call_output`` may follow (same call_id)."""
+    if name in _SKIP_WORKFLOW_TOOL_NAMES or name in _PLANNING_TOOL_NAMES:
+        return False
+    if _tool_payload_richness(root) >= 80:
+        return False
+    if not isinstance(root, dict):
+        return True
+    try:
+        si = int(root.get("stepIndex", 0))
+    except (TypeError, ValueError):
+        si = 0
+    if si > 0:
+        return False
+    dt = str(root.get("displayText") or "").strip()
+    generic = f"已完成：{name}"
+    if dt and dt != generic:
+        return False
+    return True
+
+
 def _subtasks_from_create_plan_args(arguments: Any) -> list[dict[str, Any]]:
     args = _parse_json_loose(arguments)
     if not isinstance(args, dict):
@@ -192,21 +294,50 @@ def _subtasks_from_create_plan_args(arguments: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _normalize_declared_skill(raw: str) -> str | None:
+    s = raw.strip().replace("-", "_").lower()
+    if not s:
+        return None
+    for k in _GOV_ORDER_SKILLS:
+        if s == k or s.endswith(k) or k in s:
+            return k
+    return None
+
+
+def _skill_from_text(text: str) -> str | None:
+    """Match gov pipeline skills; order matters (e.g. 审核 before 起草 in compound text)."""
+    if not text:
+        return None
+    t = text.lower()
+    if "doc_reviewer" in t or "审核" in text or "校对" in text:
+        return "doc_reviewer"
+    if "gov_document_layout" in t or "版式" in text or "排版" in text or "layout" in t:
+        return "gov_document_layout"
+    if "gov_document_writer" in t or "写作" in text or "起草" in text:
+        return "gov_document_writer"
+    if "doc_retrieval" in t or "检索" in text:
+        return "doc_retrieval"
+    return None
+
+
 def _infer_protocol_skill_for_subtask(
     st: dict[str, Any],
     index_one_based: int,
 ) -> str:
-    name = str(st.get("name") or st.get("title") or "").lower()
-    desc = str(st.get("description") or "").lower()
-    blob = name + " " + desc
-    if "doc_retrieval" in blob or "检索" in blob:
-        return "retrieval"
-    if "gov_document_writer" in blob or "写作" in blob or "起草" in blob:
-        return "writing"
-    if "doc_reviewer" in blob or "审核" in blob or "校对" in blob:
-        return "doc_reviewer"
-    if "gov_document_layout" in blob or "layout" in blob or "版式" in blob:
-        return "gov_document_layout"
+    for key in ("skillName", "skill", "tool", "agent_tool"):
+        v = st.get(key)
+        if isinstance(v, str):
+            hit = _normalize_declared_skill(v)
+            if hit:
+                return hit
+    title = str(st.get("name") or st.get("title") or "")
+    hit = _skill_from_text(title)
+    if hit:
+        return hit
+    desc = str(st.get("description") or st.get("expected_outcome") or "")
+    hit = _skill_from_text(desc)
+    if hit:
+        return hit
     if 1 <= index_one_based <= len(_GOV_ORDER_SKILLS):
         return _GOV_ORDER_SKILLS[index_one_based - 1]
     return f"step_{index_one_based}"
@@ -255,7 +386,7 @@ def _build_plan_payload(
 
 
 # Fields stored on the gov tool JSON root (siblings of ``normalizedResult``)
-# that clients expect in the workflow payload / ``result`` envelope.
+# that clients expect merged into workflow ``payload.normalizedResult``.
 _WORKFLOW_RESULT_KEYS_FROM_ROOT: frozenset[str] = frozenset(
     {
         "document",
@@ -272,9 +403,8 @@ def _build_workflow_result_envelope(root: dict[str, Any]) -> dict[str, Any]:
     """Merge ``normalizedResult`` with top-level tool fields (doc_reviewer, layout).
 
     ``doc_reviewer`` puts ``document`` under ``normalizedResult`` but ``resultList``
-    on the root. ``gov_document_layout`` puts ``savePath`` and ``resultList`` on
-    the root without ``normalizedResult``. Expose one consistent object for
-    ``normalizedResult`` and ``result``.
+    on the root.     ``gov_document_layout`` sets ``normalizedResult.resultList`` to a flat list of
+    template dicts and may keep ``savePath`` at the root. Produce one object for SSE ``payload.normalizedResult``.
     """
     out: dict[str, Any] = {}
     nr = root.get("normalizedResult")
@@ -332,12 +462,7 @@ def _stop_payload_from_tool_root(
         "sourceState": source_state,
         "errorDetail": err,
         "normalizedResult": env_copy,
-        "result": dict(envelope),
     }
-    if "resultList" in root and root.get("resultList") is not None:
-        payload["resultList"] = root["resultList"]
-    if "savePath" in root and root.get("savePath") is not None:
-        payload["savePath"] = root["savePath"]
     return payload
 
 
@@ -348,10 +473,52 @@ class AgentLoopWorkflowSseTransformer:
 
     def __init__(self) -> None:
         self._terminal_emitted = False
-        self._open_planning_call_ids: set[str] = set()
-        self._open_skill_call_ids: dict[str, str] = {}  # call_id -> protocol skill
         self._text_block_open = False
         self._last_text_key: str | None = None
+        # Drop only bit-identical completion repeats (content envelope + plugin message).
+        self._seen_completed_sigs: set[str] = set()
+        # Scaffold completions (same call_id) may precede real tool output; defer weak ones.
+        self._pending_tool_completion: dict[tuple[str, str], dict[str, Any]] = {}
+        # Suppress trailing empty plan completions after a non-empty plan in the same run.
+        self._emitted_nonempty_plan: bool = False
+        # (tool_name, call_id): tool_use start already sent; completed must emit stop only.
+        self._tool_use_started: set[tuple[str, str]] = set()
+        # After emitting content_block_stop for a tool row, drop duplicate in_progress upstream.
+        self._tool_completed_keys: set[tuple[str, str]] = set()
+        # Tool names that already emitted a non-placeholder completion; stale deferred
+        # placeholders for another call_id must not flush at stream end (duplicate stop).
+        self._tool_emitted_substantial_completion: set[str] = set()
+
+    def _emit_error_content_block_sse(self, error_detail: str) -> str:
+        """One paired ``tool_use`` block for passthrough errors (start + stop)."""
+        parts: list[str] = []
+        parts.append(self._emit_text_stop())
+        parts.append(
+            self._emit_tool_use_start(
+                skill_name="error",
+                display_text="运行错误",
+            ),
+        )
+        parts.append(
+            _wf_line(
+                {
+                    "type": "content_block_stop",
+                    "payload": {
+                        "tool": "error",
+                        "skillName": "error",
+                        "displayText": "运行错误",
+                        "retryable": False,
+                        "sourceState": "error",
+                        "errorDetail": error_detail,
+                        "normalizedResult": {
+                            "source": "error",
+                            "errorDetail": error_detail,
+                        },
+                    },
+                },
+            ),
+        )
+        return "".join(parts)
 
     def _emit_text_start(self) -> str:
         if self._text_block_open:
@@ -397,33 +564,102 @@ class AgentLoopWorkflowSseTransformer:
             },
         )
 
-    def _close_skill_blocks(self, except_call_id: str | None) -> str:
+    def _emit_tool_use_start(self, *, skill_name: str, display_text: str) -> str:
+        return _wf_line(
+            {
+                "type": "content_block_start",
+                "content_block": {
+                    "type": "tool_use",
+                    "skillName": skill_name,
+                    "displayText": display_text,
+                },
+            },
+        )
+
+    @staticmethod
+    def _tool_use_start_label(protocol_skill: str, root: dict[str, Any] | None) -> str:
+        if isinstance(root, dict):
+            st = root.get("stepTitle")
+            if isinstance(st, str) and st.strip() and st.strip() != protocol_skill:
+                return f"进行中：{st.strip()}"
+            dt = root.get("displayText")
+            if isinstance(dt, str) and "已完成：" in dt:
+                return dt.replace("已完成：", "进行中：", 1)
+        return f"进行中：{protocol_skill}"
+
+    def _format_completed_tool_sse(self, row: dict[str, Any]) -> str:
+        """Emit ``content_block_stop``; add ``content_block_start`` if not sent at in_progress."""
+        name = row["name"]
+        call_id = row.get("call_id")
+        cid = call_id if isinstance(call_id, str) and call_id else f"anon:{name}"
+        protocol_skill = name
+        tool_key = (name, cid)
+        fp = _completion_fingerprint(row)
+        sig = f"{name}:{cid}:{fp}"
+        if sig in self._seen_completed_sigs:
+            return ""
+        self._seen_completed_sigs.add(sig)
         parts: list[str] = []
-        for cid, skill in list(self._open_skill_call_ids.items()):
-            if except_call_id and cid == except_call_id:
-                continue
-            parts.append(
-                _wf_line(
-                    {
-                        "type": "content_block_stop",
-                        "payload": _stop_payload_from_tool_root(
-                            tool_name=skill,
-                            protocol_skill=skill,
-                            root={
-                                "displayText": f"已中断：{skill}",
-                                "sourceState": "error",
-                                "errorDetail": "stream_end",
-                                "normalizedResult": {
-                                    "source": "error",
-                                    "errorDetail": "stream_end",
-                                },
-                            },
-                        ),
-                    },
-                ),
-            )
-            del self._open_skill_call_ids[cid]
+        parts.append(self._emit_text_stop())
+        root = _tool_result_root(row.get("output"))
+        fallback_started_key: tuple[str, str] | None = None
+        if tool_key in self._tool_use_started:
+            self._tool_use_started.discard(tool_key)
+        else:
+            # Upstream sometimes uses one ``call_id`` on ``in_progress`` and another on
+            # ``completed``; avoid synthesizing a second ``content_block_start``.
+            same_skill_open = [k for k in self._tool_use_started if k[0] == name]
+            if len(same_skill_open) == 1:
+                fallback_started_key = same_skill_open[0]
+                self._tool_use_started.discard(fallback_started_key)
+            else:
+                start_label = self._tool_use_start_label(protocol_skill, root)
+                parts.append(
+                    self._emit_tool_use_start(
+                        skill_name=protocol_skill,
+                        display_text=start_label,
+                    ),
+                )
+        parts.append(
+            _wf_line(
+                {
+                    "type": "content_block_stop",
+                    "payload": _stop_payload_from_tool_root(
+                        tool_name=name,
+                        protocol_skill=protocol_skill,
+                        root=root,
+                    ),
+                },
+            ),
+        )
+        self._tool_completed_keys.add(tool_key)
+        if fallback_started_key is not None:
+            self._tool_completed_keys.add(fallback_started_key)
+        if not _is_deferrable_placeholder_tool(name, root):
+            self._tool_emitted_substantial_completion.add(name)
         return "".join(parts)
+
+    def _flush_pending_tool_placeholders(self) -> str:
+        """Emit deferred weak completions if no richer one arrived (stream end)."""
+        if not self._pending_tool_completion:
+            return ""
+        chunks: list[str] = []
+        for _k, row in list(self._pending_tool_completion.items()):
+            name = row["name"]
+            prow = _tool_result_root(row.get("output"))
+            if (
+                name in self._tool_emitted_substantial_completion
+                and _is_deferrable_placeholder_tool(name, prow)
+            ):
+                continue
+            chunks.append(self._format_completed_tool_sse(row))
+        self._pending_tool_completion.clear()
+        return "".join(chunks)
+
+    def _close_skill_blocks(self, except_call_id: str | None) -> str:  # noqa: ARG002
+        # Do not emit synthetic "interrupted" tool stops: we no longer track
+        # in_progress call_ids (compact elision previously left orphan opens).
+        return ""
 
     def _handle_tool_row(self, row: dict[str, Any]) -> str:
         name = row["name"]
@@ -435,110 +671,91 @@ class AgentLoopWorkflowSseTransformer:
 
         status = row.get("status")
         parts: list[str] = []
+        tool_key = (name, cid)
 
         if name in _PLANNING_TOOL_NAMES:
-            proto = "a2a_planning"
-            if status == "in_progress" and cid not in self._open_planning_call_ids:
-                self._open_planning_call_ids.add(cid)
+            if status == "in_progress":
+                if tool_key in self._tool_completed_keys:
+                    return ""
                 parts.append(self._emit_text_stop())
-                label = (
-                    "进行中：执行规划"
-                    if name == "create_plan"
-                    else "进行中：修订规划"
-                )
-                parts.append(
-                    _wf_line(
-                        {
-                            "type": "content_block_start",
-                            "content_block": {
-                                "type": "tool_use",
-                                "skillName": proto,
-                                "displayText": label,
-                            },
-                        },
-                    ),
-                )
-            if status == "completed":
-                if cid not in self._open_planning_call_ids:
-                    parts.append(self._emit_text_stop())
-                    label = (
+                if tool_key not in self._tool_use_started:
+                    plan_label = (
                         "进行中：执行规划"
                         if name == "create_plan"
                         else "进行中：修订规划"
                     )
                     parts.append(
-                        _wf_line(
-                            {
-                                "type": "content_block_start",
-                                "content_block": {
-                                    "type": "tool_use",
-                                    "skillName": proto,
-                                    "displayText": label,
-                                },
-                            },
+                        self._emit_tool_use_start(
+                            skill_name="a2a_planning",
+                            display_text=plan_label,
                         ),
                     )
-                    self._open_planning_call_ids.add(cid)
+                    self._tool_use_started.add(tool_key)
+            if status == "completed":
                 subtasks = _subtasks_from_create_plan_args(row.get("arguments"))
+                if (
+                    len(subtasks) == 0
+                    and self._emitted_nonempty_plan
+                ):
+                    return ""
+                fp = _completion_fingerprint(row)
+                sig = f"{name}:{cid}:{fp}"
+                if sig in self._seen_completed_sigs:
+                    return ""
+                self._seen_completed_sigs.add(sig)
+                parts.append(self._emit_text_stop())
+                plan_label = (
+                    "进行中：执行规划"
+                    if name == "create_plan"
+                    else "进行中：修订规划"
+                )
+                if tool_key in self._tool_use_started:
+                    self._tool_use_started.discard(tool_key)
+                else:
+                    parts.append(
+                        self._emit_tool_use_start(
+                            skill_name="a2a_planning",
+                            display_text=plan_label,
+                        ),
+                    )
                 plan_payload = _build_plan_payload(
                     tool_name=name,
                     subtasks=subtasks,
                 )
+                if plan_payload.get("steps", 0) > 0:
+                    self._emitted_nonempty_plan = True
                 parts.append(
                     _wf_line(
                         {"type": "content_block_stop", "payload": plan_payload},
                     ),
                 )
-                self._open_planning_call_ids.discard(cid)
+                self._tool_completed_keys.add(tool_key)
             return "".join(parts)
 
-        protocol_skill = _PROTOCOL_SKILL_BY_TOOL.get(name, name)
-        if status == "in_progress" and cid not in self._open_skill_call_ids:
+        protocol_skill = name
+        if status == "in_progress":
+            if tool_key in self._tool_completed_keys:
+                return ""
             parts.append(self._emit_text_stop())
-            parts.append(
-                _wf_line(
-                    {
-                        "type": "content_block_start",
-                        "content_block": {
-                            "type": "tool_use",
-                            "skillName": protocol_skill,
-                            "displayText": f"进行中：{protocol_skill}",
-                        },
-                    },
-                ),
-            )
-            self._open_skill_call_ids[cid] = protocol_skill
-
-        if status == "completed":
-            if cid not in self._open_skill_call_ids:
-                parts.append(self._emit_text_stop())
+            if tool_key not in self._tool_use_started:
+                root_tip = _tool_result_root(row.get("output"))
+                start_label = self._tool_use_start_label(protocol_skill, root_tip)
                 parts.append(
-                    _wf_line(
-                        {
-                            "type": "content_block_start",
-                            "content_block": {
-                                "type": "tool_use",
-                                "skillName": protocol_skill,
-                                "displayText": f"进行中：{protocol_skill}",
-                            },
-                        },
+                    self._emit_tool_use_start(
+                        skill_name=protocol_skill,
+                        display_text=start_label,
                     ),
                 )
-                self._open_skill_call_ids[cid] = protocol_skill
+                self._tool_use_started.add(tool_key)
+
+        if status == "completed":
             root = _tool_result_root(row.get("output"))
-            self._open_skill_call_ids.pop(cid, None)
-            parts.append(
-                _wf_line(
-                    {
-                        "type": "content_block_stop",
-                        "payload": _stop_payload_from_tool_root(
-                            tool_name=name,
-                            protocol_skill=protocol_skill,
-                            root=root,
-                        ),
-                    },
-                ),
-            )
+            if _is_deferrable_placeholder_tool(name, root):
+                if name not in self._tool_emitted_substantial_completion:
+                    self._pending_tool_completion[tool_key] = row
+            else:
+                self._pending_tool_completion.pop(tool_key, None)
+                parts.append(self._format_completed_tool_sse(row))
         return "".join(parts)
 
     def _handle_content_text(self, d: dict[str, Any]) -> str:
@@ -558,7 +775,12 @@ class AgentLoopWorkflowSseTransformer:
                 self._last_text_key = key
             parts.append(self._emit_text_delta(text))
         elif status == "completed":
+            # Upstream may send only ``completed`` without ``in_progress``; keep
+            # ``content_block_start`` paired before any ``content_block_delta``.
+            if not self._text_block_open:
+                parts.append(self._emit_text_start())
             parts.append(self._emit_text_delta(text))
+            parts.append(self._flush_pending_tool_placeholders())
             parts.append(self._emit_text_stop())
             self._last_text_key = None
         return "".join(parts)
@@ -586,25 +808,8 @@ class AgentLoopWorkflowSseTransformer:
             if not isinstance(inner, dict):
                 continue
             if isinstance(inner.get("error"), str):
-                out_chunks.append(self._emit_text_stop())
                 out_chunks.append(
-                    _wf_line(
-                        {
-                            "type": "content_block_stop",
-                            "payload": {
-                                "tool": "error",
-                                "skillName": "error",
-                                "displayText": "运行错误",
-                                "retryable": False,
-                                "sourceState": "error",
-                                "errorDetail": inner.get("error"),
-                                "normalizedResult": {
-                                    "source": "error",
-                                    "errorDetail": inner.get("error"),
-                                },
-                            },
-                        },
-                    ),
+                    self._emit_error_content_block_sse(inner["error"]),
                 )
                 continue
 
@@ -619,30 +824,15 @@ class AgentLoopWorkflowSseTransformer:
         return "".join(out_chunks)
 
     def _flush_unfinished_planning(self) -> str:
-        if not self._open_planning_call_ids:
-            return ""
-        self._open_planning_call_ids.clear()
-        return _wf_line(
-            {
-                "type": "content_block_stop",
-                "payload": {
-                    "tool": "a2a_planning",
-                    "displayText": "规划阶段已结束（流中断）",
-                    "steps": 0,
-                    "plan": {
-                        "intent": "document_workflow",
-                        "summary": "上游连接在规划完成前结束。",
-                        "steps": [],
-                    },
-                },
-            },
-        )
+        # Unfinished planning is no longer tracked via call_id (see _close_skill_blocks).
+        return ""
 
     def _terminal_payload(self) -> str:
         if self._terminal_emitted:
             return ""
         self._terminal_emitted = True
-        tail = self._emit_text_stop()
+        tail = self._flush_pending_tool_placeholders()
+        tail += self._emit_text_stop()
         tail += self._close_skill_blocks(except_call_id=None)
         tail += self._flush_unfinished_planning()
         tail += _wf_line({"type": "message_stop"})
@@ -653,7 +843,8 @@ class AgentLoopWorkflowSseTransformer:
         """Flush open blocks and emit terminal markers if not already sent."""
         if self._terminal_emitted:
             return ""
-        parts = self._emit_text_stop()
+        parts = self._flush_pending_tool_placeholders()
+        parts += self._emit_text_stop()
         parts += self._close_skill_blocks(except_call_id=None)
         parts += self._flush_unfinished_planning()
         self._terminal_emitted = True

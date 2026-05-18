@@ -25,6 +25,10 @@ from agentscope_runtime.engine.schemas.exception import (
 )
 
 from ...config import load_config
+from ...plan.hints import (
+    PLAN_GATE_UI_HIDE_DENIED_TOOL_RESULT_KEY,
+    PLAN_GATE_UI_HIDE_TOOL_IDS_KEY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +338,7 @@ def agentscope_msg_to_message(
             "original_name": msg.name,
             "metadata": msg.metadata,
         }
+        msg_md = msg.metadata or {}
 
         if isinstance(msg.content, str):
             message = Message(type=MessageType.MESSAGE, role=role)
@@ -393,6 +398,13 @@ def agentscope_msg_to_message(
                 current_message.add_content(new_content=text_content)
 
             elif btype == "tool_use":
+                hide_ids = msg_md.get(PLAN_GATE_UI_HIDE_TOOL_IDS_KEY)
+                if (
+                    isinstance(hide_ids, list)
+                    and block.get("id") in hide_ids
+                ):
+                    continue
+
                 if current_message:
                     results.append(current_message.completed())
 
@@ -425,6 +437,9 @@ def agentscope_msg_to_message(
                 current_message.add_content(new_content=data_content)
 
             elif btype == "tool_result":
+                if msg_md.get(PLAN_GATE_UI_HIDE_DENIED_TOOL_RESULT_KEY):
+                    continue
+
                 if current_message:
                     results.append(current_message.completed())
 

@@ -194,6 +194,26 @@ def _layout_result_list_for_client(rl: dict[str, Any]) -> dict[str, Any] | None:
     return out if out else None
 
 
+def _layout_templates_array_for_normalized_result(result_list: dict[str, Any]) -> list[dict[str, Any]]:
+    """Shape ``normalizedResult.resultList`` as a flat list of template objects."""
+    if not isinstance(result_list, dict):
+        return []
+    client_rl = _layout_result_list_for_client(result_list)
+    if isinstance(client_rl, dict):
+        rec = client_rl.get("recommended")
+        if isinstance(rec, list) and rec:
+            return [x for x in rec if isinstance(x, dict)]
+    for key in ("templates", "list"):
+        block = result_list.get(key)
+        if isinstance(block, list) and block:
+            return [x for x in block if isinstance(x, dict)]
+    if isinstance(client_rl, dict):
+        rec = client_rl.get("recommended")
+        if isinstance(rec, list):
+            return [x for x in rec if isinstance(x, dict)]
+    return []
+
+
 def _write_gov_docx(
     path: Path,
     heading: str,
@@ -429,9 +449,9 @@ def _gov_layout_ok_json_recommend_only(
         "errorDetail": None,
         "savePath": pending_save_path,
     }
-    client_rl = _layout_result_list_for_client(result_list)
-    if client_rl is not None:
-        root["resultList"] = client_rl
+    arr = _layout_templates_array_for_normalized_result(result_list)
+    if arr:
+        root["normalizedResult"] = {"resultList": arr}
     return _gov_doc_tool_json(root)
 
 
@@ -734,17 +754,17 @@ async def doc_reviewer(
     end_line: int | None = None,
     **extra: Any,
 ) -> ToolResponse:
-    """Inline or file-based draft for review (校对、审阅、定稿).
+    """公文/正式文稿校对、审阅与定稿：支持**内联正文**或**工作区文件路径**。
 
-    Exposed to the model as ``doc_reviewer``. Intended to review **the body
-    produced by the previous ``gov_document_writer`` step** (plain ``content`` /
-    ``document``, ``normalizedResult.document``, or a stringified / block-array
-    tool JSON envelope). If that cannot be resolved, falls back to
-    ``file_path`` / ``path`` (same resolution as :func:`read_file`).
+    对模型暴露为 ``doc_reviewer``。优先审核上一步 ``gov_document_writer`` 的输出正文，
+    可通过下列任一方式传入：纯文本 ``content`` / ``document``；JSON 字段
+    ``normalizedResult.document``；或上一步工具的 JSON（整段字符串、或文本块数组形态）。
+    若仍得不到有效正文，再使用 ``file_path`` / ``path`` 指向工作区内文件；
+    路径解析与同项目读取工作区文件的规则一致——**由本工具内部读取，不必再单独调用其它
+    读文件工具**。
 
-    Returns a JSON envelope; ``normalizedResult.document`` is the
-    **审核修改后正文** (LLM-revised full text). Top-level ``resultList`` holds
-    structured change entries (``reason``, ``offsets``, ``errorType``, …).
+    返回值为 JSON：``normalizedResult.document`` 为审核修改后的**全文定稿**；顶层
+    ``resultList`` 列出结构化改动项（字段含 ``reason``、``offsets``、``errorType`` 等）。
     """
     ex = {k: v for k, v in extra.items()}
     prior_body = (
@@ -783,6 +803,19 @@ async def doc_reviewer(
         block0 = read_resp.content[0] if read_resp.content else None
         draft = _content_block_text(block0) or ""
         if draft.startswith("Error:"):
+            if (
+                "does not exist" in draft.lower()
+                or "is not a file" in draft
+            ):
+                resolved = _resolve_file_path(target)
+                return _doc_reviewer_error(
+                    "未能读取待审核正文：工作区不存在该路径。公文流水线要求把上一步 "
+                    "`gov_document_writer` 工具返回的正文整块传入本工具——请复制其 "
+                    "JSON 内的 `normalizedResult.document`（或把含该字段的整条工具 "
+                    "结果）作为参数 `content` / `data` 传入；**请勿**仅用根据主题或"
+                    "检索标题臆造的 `file_path`/`path`。本次解析路径：" + resolved + "。"
+                    " 原始报错：" + draft,
+                )
             return _doc_reviewer_error(draft)
 
     try:
@@ -986,7 +1019,7 @@ async def gov_document_layout(
     （若运行时将未知键合并进 ``extra``）；正文类键即使出现在 ``extra`` 内也会被忽略，
     不参与 HaiRuo 请求。
 
-    成功时返回非空的 ``savePath``：与原先写盘时相同的**待写入**绝对路径（本步不创建文件）。
+    成功时在 ``normalizedResult.resultList`` 中返回 HaiRuo 推荐模板列表（``[{...}, ...]``，非 ``recommended`` 嵌套）；``savePath`` 仍在根上。
     可传入显式 ``resultList`` / ``templates``（非空时跳过 HaiRuo 请求，仍须 ``template_title``）。
     不接受 ``templateTitle`` 驼峰键名（请用 ``template_title``）。
     """

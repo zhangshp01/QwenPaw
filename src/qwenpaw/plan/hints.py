@@ -78,6 +78,50 @@ def check_plan_tool_gate(  # pylint: disable=protected-access
     )
 
 
+# ``Msg.metadata`` keys: hide phantom plan-gated tool rows when loading chat
+# history (memory → ``agentscope_msg_to_message``), matching live SSE omission.
+PLAN_GATE_UI_HIDE_TOOL_IDS_KEY = "qp_hide_plan_gate_tool_ids"
+PLAN_GATE_UI_HIDE_DENIED_TOOL_RESULT_KEY = "qp_hide_plan_gate_denial_tool_msg"
+
+
+def filter_plan_gate_blocked_tool_calls_for_stream(
+    plan_notebook,
+    content: list,
+) -> list | None:
+    """Remove ``tool_use`` blocks that :func:`check_plan_tool_gate` would block.
+
+    When the runner has enabled the ``/plan`` gate and no plan exists yet, the
+    model may still emit disallowed ``tool_use`` chunks; execution is skipped
+    in the agent ``_acting`` path with an in-context tool result instead.
+    Stripping those blocks before streaming ``print`` hides them from SSE and
+    console consumers.
+
+    Returns:
+        ``None`` when *content* is unchanged (not a list, or gate inactive).
+        A new ``list`` when at least one block was removed — possibly empty.
+    """
+    # pylint: disable=protected-access
+    if plan_notebook is None or not isinstance(content, list):
+        return None
+    out: list = []
+    changed = False
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            if (
+                check_plan_tool_gate(
+                    plan_notebook,
+                    str(block.get("name", "")),
+                )
+                is not None
+            ):
+                changed = True
+                continue
+        out.append(block)
+    if not changed:
+        return None
+    return out
+
+
 def should_skip_auto_continue(  # pylint: disable=protected-access
     plan_notebook,
 ) -> bool:
@@ -180,6 +224,19 @@ def _gov_pipeline_tool_reminder(subtask_idx: int, plan_notebook) -> str:
         )
     if 0 <= subtask_idx < len(_GOV_PIPELINE_TOOL_NAMES):
         name = _GOV_PIPELINE_TOOL_NAMES[subtask_idx]
+        review_inline = ""
+        if name == "doc_reviewer":
+            review_inline = (
+                "**必须**将上一步 ``gov_document_writer`` 输出的 "
+                "``normalizedResult.document``（或含该字段的整条工具 JSON）"
+                "写入 ``content`` / ``data``；**禁止**用主题臆造 ``file_path``。"
+            )
+            return (
+                f"\n**Gov-document pipeline**: this subtask MUST invoke tool "
+                f"`{name}` (exact name).\n"
+                + review_inline
+                + "\n"
+            )
         return (
             f"\n**Gov-document pipeline**: this subtask MUST invoke tool "
             f"`{name}` (exact name).\n"
@@ -193,8 +250,8 @@ _GOV_DOC_PIPELINE_NO_PLAN = (
     + "你处于 **/plan 流水线**（自动执行；无需向用户确认）。\n"
     "**请先判断**：用户是否在求「**新写一篇正式公文**」（需从检索/材料到起草、审核、版式"
     "的完整链路）。\n"
-    "• **不需要写公文**（如仅审核/校对/点评已贴正文、摘录、一般问答、或其它与「新拟公文」"
-    "无关的诉求）：调用 `create_plan` 按实际任务拆分子任务；执行时按依赖**按需**选用工具，"
+    "• **不需要写公文**（a,仅检索/查找/寻找相关材料；b,仅审核/校对/点评已贴正文、摘录、一般问答、或其它与「新拟公文」"
+    "无关的诉求；c,仅需要对已存在文本进行排版等与公文编写无关的内容）：调用 `create_plan` 按实际任务拆分子任务；执行时按依赖**按需**选用工具，"
     "**勿**机械套用下述四工具流水线。\n"
     "• **需要写公文**：调用 `create_plan`，**恰好四个**子任务，**严格**按下述顺序；"
     "每个子任务阶段**只**调用对应工具，完成后再进入下一步：\n"
@@ -202,10 +259,14 @@ _GOV_DOC_PIPELINE_NO_PLAN = (
     "规范化内容为空，则在无材料情况下继续流水线。\n"
     "2) **起草**：工具 `gov_document_writer` — 综合检索结果（如 normalizedResult）、"
     "用户说明与相关用户记忆文件；响应仅为 JSON（``normalizedResult.document``），"
-    "勿含 ``savePath`` 或工作区落盘文件。\n"
-    "3) **审核**：工具 `doc_reviewer` — 传入上一步 ``gov_document_writer`` 的正文"
-    "（``normalizedResult.document`` 或同结构工具 JSON / 块数组）；"
-    "4) **版式**：每轮流水线对 `gov_document_layout` **只调用一次**，"
+    "勿含 ``savePath`` 或工作区落盘文件，禁止调用write_file工具写文件。\n"
+    "3) **审核**：工具 `doc_reviewer` — **必须**把上一步 ``gov_document_writer`` 返回的"
+    "全文（``normalizedResult.document`` 或含该字段的完整工具 JSON / 块数组）"
+    "放入参数 ``content`` 或 ``data``；**禁止**根据主题或检索结果标题臆造 "
+    "``file_path``/``path``（工作区通常没有「某某职责说明」这类文件名），"
+    "禁止调用write_file工具写文件；仅当正文确实已保存为工作区真实文件且你能给出"
+    "正确相对路径时，才可使用 ``file_path`` / ``path``。\n"
+    "4) **版式**：每轮流水线对 `gov_document_layout` **只调用一次**，禁止调用write_file工具写文件"
     "且 **仅**传 ``template_title``（公文标题）。**不要**传 ``content``、"
     "``file_path``，也勿再次调用该工具：该步 **仅** 获取版式推荐，**不** 写入 ``.docx``，"
     "并返回非空的 ``savePath`` 字符串作为 **待定** 输出路径（文件名规则同此前；"
@@ -229,11 +290,12 @@ _GOV_DOC_PIPELINE_NO_PLAN_SKIP_RETRIEVAL = (
     "调用 `finish_subtask` 给出简短结果。\n"
     "2) **起草**：工具 `gov_document_writer` — 结合用户提供的材料、起草说明，"
     "必要时结合用户记忆文件；响应仅为 JSON（``normalizedResult.document``），"
-    "勿含 ``savePath`` 或工作区落盘文件。\n"
-    "3) **审核**：工具 `doc_reviewer` — 传入上一步 ``gov_document_writer`` 的正文"
-    "（``normalizedResult.document`` 或同结构工具 JSON / 块数组）；"
-    "仅当缺失时才用 ``file_path`` / ``path``。\n"
-    "4) **版式**：每轮流水线对 `gov_document_layout` **只调用一次**，"
+    "勿含 ``savePath`` 或工作区落盘文件，禁止调用write_file工具写文件。\n"
+    "3) **审核**：工具 `doc_reviewer` — **必须**传入上一步写作工具返回的正文 "
+    "（``normalizedResult.document`` 或完整工具 JSON）；**禁止**臆造 "
+    "``file_path``/``path``；禁止调用write_file工具写文件；"
+    "**仅当**正文已在工作区存成真实文件并知道正确路径时，才可用 ``file_path`` / ``path``。\n"
+    "4) **版式**：每轮流水线对 `gov_document_layout` **只调用一次**，禁止调用write_file工具写文件。"
     "且 **仅**传 ``template_title``（公文标题）。**不要**传 ``content``、"
     "``file_path``，也勿再次调用该工具：该步 **仅** 获取版式推荐，**不** 写入 ``.docx``，"
     "并返回非空的 ``savePath`` 字符串作为 **待定** 输出路径（文件名规则同此前；"

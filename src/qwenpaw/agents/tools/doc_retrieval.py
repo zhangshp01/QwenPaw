@@ -150,7 +150,7 @@ async def doc_retrieval(
     query: str = "",
     dataset_ids: str = "",
     page: int = 1,
-    page_size: int = 10,
+    page_size: int = 2,
     title: str = "",
     keywords: str = "",
     output_format: str = "text",
@@ -206,7 +206,7 @@ async def doc_retrieval(
     kwargs: dict[str, Any] = {
         "dataset_ids": dataset_ids.strip() if (dataset_ids or "").strip() else None,
         "page": int(page) if page else 1,
-        "page_size": int(page_size) if page_size else 10,
+        "page_size": int(page_size) if page_size else 2,
         "title": title or "",
         "keywords": keywords or "",
     }

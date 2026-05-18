@@ -64,6 +64,28 @@ def test_doc_reviewer_requires_input():
     asyncio.run(_run())
 
 
+def test_doc_reviewer_bogus_file_path_explains_pipeline():
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            set_current_workspace_dir(root)
+            fake = AsyncMock(return_value=("x", []))
+            with patch(_DOC_REVIEW_PATCH, fake):
+                r = await doc_reviewer(
+                    content="",
+                    file_path="不存在的自拟标题说明",
+                    path="",
+                )
+            p = _json_payload(r)
+            assert p["sourceState"] == "error"
+            detail = str(p.get("errorDetail") or "")
+            assert "normalizedResult.document" in detail or "gov_document_writer" in detail
+            assert "臆造" in detail or "content" in detail
+            fake.assert_not_called()
+
+    asyncio.run(_run())
+
+
 def test_doc_reviewer_reads_file():
     async def _run():
         fake = AsyncMock(return_value=("hello-revised", []))
@@ -327,6 +349,7 @@ def test_gov_document_layout_mocked_fetch_returns_pending_save_path_no_file():
             assert "govdocs" in sp.replace("\\", "/")
             assert not Path(sp).exists()
             assert "resultList" not in p
+            assert p["normalizedResult"]["resultList"][0]["id"] == "1"
 
     asyncio.run(_run())
 
@@ -387,9 +410,9 @@ def test_gov_document_layout_client_json_omits_templates_keeps_recommended():
             ):
                 r = await gov_document_layout(template_title="场景")
             p = _json_payload(r)
-            assert p["resultList"] == {"recommended": rec}
-            assert "templates" not in p["resultList"]
+            assert p["normalizedResult"]["resultList"] == rec
             assert p.get("savePath")
+            assert "resultList" not in p
 
     asyncio.run(_run())
 
@@ -426,6 +449,9 @@ def test_gov_document_layout_explicit_templates_skips_fetch():
             assert p.get("savePath")
             assert not Path(p["savePath"]).exists()
             assert "resultList" not in p
+            rl = (p.get("normalizedResult") or {}).get("resultList")
+            assert isinstance(rl, list) and len(rl) == 1
+            assert rl[0]["id"] == "7eac05530af3445fa3dccf343e8c4e36"
 
     asyncio.run(_run())
 
