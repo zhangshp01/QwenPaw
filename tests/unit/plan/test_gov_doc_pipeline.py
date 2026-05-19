@@ -42,6 +42,13 @@ def test_user_materials_marker_in_text():
     )
 
 
+def test_user_materials_review_inline_body():
+    assert user_brought_gov_doc_materials(
+        "请帮我审核如下信息：省大数据局负责……",
+        has_file_attachment=False,
+    )
+
+
 def test_user_materials_no_marker_no_file():
     assert not user_brought_gov_doc_materials(
         "写一篇关于加强数据安全的通知",

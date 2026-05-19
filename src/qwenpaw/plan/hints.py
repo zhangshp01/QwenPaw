@@ -14,14 +14,15 @@ Differences from AgentScope's DefaultPlanToHint:
    so per-iteration context cost stays constant.
 4. Properly handles abandoned subtasks in all hint branches.
 5. Optional **gov-document /plan pipeline** — when the runner sets
-   ``_plan_gov_doc_pipeline`` on the notebook, ``create_plan`` is guided to
-   a fixed four-tool sequence. When ``_plan_skip_doc_retrieval`` is set,
-   subtask 0 must not use ``doc_retrieval``.
+   ``_plan_gov_doc_pipeline`` on the notebook, ``create_plan`` is guided by
+   intent-first hints (review / layout / write / retrieve / full draft).
+   When ``_plan_skip_doc_retrieval`` is set, plans must not call
+   ``doc_retrieval`` for material the user already supplied.
 """
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from agentscope.plan import Plan
@@ -210,117 +211,192 @@ _GOV_PIPELINE_TOOL_NAMES = (
     "gov_document_layout",
 )
 
+_GOV_TOOL_FORBIDDEN_WHEN_NARROW: dict[str, frozenset[str]] = {
+    "doc_reviewer": frozenset(
+        {"doc_retrieval", "gov_document_writer", "gov_document_layout"},
+    ),
+    "gov_document_layout": frozenset(
+        {"doc_retrieval", "gov_document_writer", "doc_reviewer"},
+    ),
+    "gov_document_writer": frozenset(
+        {"doc_retrieval", "gov_document_layout", "doc_reviewer"},
+    ),
+    "doc_retrieval": frozenset(
+        {"gov_document_writer", "doc_reviewer", "gov_document_layout"},
+    ),
+}
 
-def _gov_pipeline_tool_reminder(subtask_idx: int, plan_notebook) -> str:
+
+def _infer_gov_tool_from_text(text: str) -> str | None:
+    """Match a gov skill name from subtask title/description (order matters)."""
+    if not text:
+        return None
+    t = text.lower()
+    if "doc_reviewer" in t or "审核" in text or "校对" in text or "润色" in text:
+        return "doc_reviewer"
+    if (
+        "gov_document_layout" in t
+        or "版式" in text
+        or "排版" in text
+        or "模板" in text
+        or "layout" in t
+    ):
+        return "gov_document_layout"
+    if (
+        "gov_document_writer" in t
+        or "gov-document-writer" in t
+        or "写作" in text
+        or "起草" in text
+        or "生成公文" in text
+        or "拟一份" in text
+    ):
+        return "gov_document_writer"
+    if "doc_retrieval" in t or "检索" in text or "查找资料" in text or "找资料" in text:
+        return "doc_retrieval"
+    return None
+
+
+def _subtask_gov_tool_hint(subtask: Any) -> str | None:
+    """Infer intended gov tool from one plan subtask's text fields."""
+    parts = [
+        str(getattr(subtask, "name", "") or ""),
+        str(getattr(subtask, "description", "") or ""),
+        str(getattr(subtask, "expected_outcome", "") or ""),
+    ]
+    return _infer_gov_tool_from_text(" ".join(parts))
+
+
+def _tool_specific_reminder_lines(tool_name: str) -> str:
+    if tool_name == "doc_reviewer":
+        return (
+            "**必须**将待审正文写入 ``content`` / ``data``（含 "
+            "``normalizedResult.document`` 或上一步 writer 的完整 JSON）；"
+            "**禁止**用主题臆造 ``file_path``。\n"
+        )
+    if tool_name == "gov_document_layout":
+        return (
+            "**仅**传 ``template_title``（公文标题）取版式推荐；"
+            "**不要**传大段 ``content`` / ``file_path``。\n"
+        )
+    if tool_name == "gov_document_writer":
+        return (
+            "响应仅为 JSON（``normalizedResult.document``）；"
+            "**勿**含 ``savePath`` 或调用 write_file 落盘。\n"
+        )
+    if tool_name == "doc_retrieval":
+        return "检索完成后 **勿**自动起草/审核/排版；若用户仅要检索，``finish_plan`` 即可。\n"
+    return ""
+
+
+def _gov_pipeline_tool_reminder(
+    subtask_idx: int,
+    plan: "Plan",
+    plan_notebook,
+) -> str:
+    """Remind the model which gov tool matches the **current subtask**, not its index."""
     skip = (
         plan_notebook is not None
         and bool(getattr(plan_notebook, "_plan_skip_doc_retrieval", False))
     )
-    if subtask_idx == 0 and skip:
+    if subtask_idx < 0 or subtask_idx >= len(plan.subtasks):
+        return ""
+    st = plan.subtasks[subtask_idx]
+    tool = _subtask_gov_tool_hint(st)
+    if tool == "doc_retrieval" and skip:
         return (
-            "\n**公文流水线**：本回合已含用户提供的参考资料（附件与/或消息内明示来源）。"
-            "**不要**调用 `doc_retrieval`。起草时仅将用户消息与附件视作事实输入；"
-            "调用 `finish_subtask` 给出简要结果后继续。\n"
+            "\n**公文 /plan**：用户已提供参考材料，**不要**调用 `doc_retrieval`。"
+            "若本子任务仅为消化材料，调用 `finish_subtask` 简述即可；"
+            "若需起草/审核/版式，改用对应工具。\n"
         )
-    if 0 <= subtask_idx < len(_GOV_PIPELINE_TOOL_NAMES):
-        name = _GOV_PIPELINE_TOOL_NAMES[subtask_idx]
-        review_inline = ""
-        if name == "doc_reviewer":
-            review_inline = (
-                "**必须**将上一步 ``gov_document_writer`` 输出的 "
-                "``normalizedResult.document``（或含该字段的整条工具 JSON）"
-                "写入 ``content`` / ``data``；**禁止**用主题臆造 ``file_path``。"
-            )
-            return (
-                f"\n**Gov-document pipeline**: this subtask MUST invoke tool "
-                f"`{name}` (exact name).\n"
-                + review_inline
-                + "\n"
+    if tool:
+        forbidden = _GOV_TOOL_FORBIDDEN_WHEN_NARROW.get(tool, frozenset())
+        forbid_line = ""
+        if forbidden:
+            forbid_line = (
+                "**禁止**调用计划外工具："
+                + "、".join(f"`{x}`" for x in sorted(forbidden))
+                + "。\n"
             )
         return (
-            f"\n**Gov-document pipeline**: this subtask MUST invoke tool "
-            f"`{name}` (exact name).\n"
+            f"\n**公文 /plan · 本子任务**：应调用 `{tool}`（名称须完全一致）。\n"
+            + _tool_specific_reminder_lines(tool)
+            + forbid_line
         )
-    return ""
+    return (
+        "\n**公文 /plan**：仅调用与本子任务名称/说明一致的工具；"
+        "**禁止**添加计划外步骤（如无检索诉求却 `doc_retrieval`）。\n"
+    )
 
 
 _GOV_DOC_PIPELINE_NO_PLAN = (
     "当前尚无活动计划。\n"
     + _LANG_BLOCK
-    + "你处于 **/plan 流水线**（自动执行；无需向用户确认）。\n"
-    "**请先判断**：用户是否在求「**新写一篇正式公文**」（需从检索/材料到起草、审核、版式"
-    "的完整链路）。\n"
-    "• **不需要写公文**（a,仅检索/查找/寻找相关材料；b,仅审核/校对/点评已贴正文、摘录、一般问答、或其它与「新拟公文」"
-    "无关的诉求；c,仅需要对已存在文本进行排版等与公文编写无关的内容）：调用 `create_plan` 按实际任务拆分子任务；执行时按依赖**按需**选用工具，"
-    "**勿**机械套用下述四工具流水线。\n"
-    "• **需要写公文**：调用 `create_plan`，**恰好四个**子任务，**严格**按下述顺序；"
-    "每个子任务阶段**只**调用对应工具，完成后再进入下一步：\n"
-    "1) **检索**：工具 `doc_retrieval` — 针对用户主题/问句检索；若无结果项或"
-    "规范化内容为空，则在无材料情况下继续流水线。\n"
-    "2) **起草**：工具 `gov_document_writer` — 综合检索结果（如 normalizedResult）、"
-    "用户说明与相关用户记忆文件；响应仅为 JSON（``normalizedResult.document``），"
-    "勿含 ``savePath`` 或工作区落盘文件，禁止调用write_file工具写文件。\n"
-    "3) **审核**：工具 `doc_reviewer` — **必须**把上一步 ``gov_document_writer`` 返回的"
-    "全文（``normalizedResult.document`` 或含该字段的完整工具 JSON / 块数组）"
-    "放入参数 ``content`` 或 ``data``；**禁止**根据主题或检索结果标题臆造 "
-    "``file_path``/``path``（工作区通常没有「某某职责说明」这类文件名），"
-    "禁止调用write_file工具写文件；仅当正文确实已保存为工作区真实文件且你能给出"
-    "正确相对路径时，才可使用 ``file_path`` / ``path``。\n"
-    "4) **版式**：每轮流水线对 `gov_document_layout` **只调用一次**，禁止调用write_file工具写文件"
-    "且 **仅**传 ``template_title``（公文标题）。**不要**传 ``content``、"
-    "``file_path``，也勿再次调用该工具：该步 **仅** 获取版式推荐，**不** 写入 ``.docx``，"
-    "并返回非空的 ``savePath`` 字符串作为 **待定** 输出路径（文件名规则同此前；"
-    "文件可能尚未存在）。\n"
+    + "你处于 **/plan 公文助手**（自动执行；无需向用户确认）。\n"
+    "**先判断用户真实意图（由窄到宽）**；命中靠前类别则 **只** 建该场景所需步数，"
+    "**禁止**为多做事追加无关工具或子任务。\n\n"
+    "━━ **窄场景（常见为 1 步）** ━━\n"
+    "1) **仅审核 / 校对 / 润色**（用户已贴正文，或消息含「如下信息/如下内容/原文」等）：\n"
+    "   · `create_plan` → **1 个子任务** → 工具 **仅** `doc_reviewer`\n"
+    "   · **禁止** `doc_retrieval`、`gov_document_writer`、`gov_document_layout`\n"
+    "2) **仅模板 / 版式 / 排版推荐**：\n"
+    "   · **1 步** → **仅** `gov_document_layout`（**只**传 ``template_title``）\n"
+    "   · **禁止** 检索、起草、审核\n"
+    "3) **仅检索 / 找资料**：\n"
+    "   · **1 步** → **仅** `doc_retrieval`；返回 items 后 **即** `finish_plan`\n"
+    "   · **禁止** 自动起草、审核、版式或长篇总结\n"
+    "4) **仅起草 / 生成公文**（明确要写文但 **未** 要求审核或版式）：\n"
+    "   · **1 步** → **仅** `gov_document_writer`\n"
+    "   · **禁止** 无必要的检索、审核、版式\n\n"
+    "━━ **宽场景：完整正式文稿（建议 4 步，非强制）** ━━\n"
+    "仅当用户 **明确** 要「写一篇完整公文/通知/函/报告」且 **不属于** 以上窄场景时，"
+    "可建 **4 个子任务**，顺序建议：\n"
+    "① `doc_retrieval` → ② `gov_document_writer` → ③ `doc_reviewer` → "
+    "④ `gov_document_layout`（仅 ``template_title``）。\n"
+    "每步 **只** 调用与本步目标对应的工具；用户诉求已满足时 **不要** 继续后续步。\n\n"
+    "**工具要点**：\n"
+    "· `gov_document_writer`：JSON 含 ``normalizedResult.document``，勿 ``savePath``/write_file\n"
+    "· `doc_reviewer`：正文入 ``content``/``data``，勿臆造 ``file_path``\n"
+    "· `gov_document_layout`：仅 ``template_title``，勿传大段正文\n\n"
     "`create_plan` 成功后 **不要** 请用户确认。"
-    "**立即**调用 `update_subtask_state`，subtask_idx=0、state='in_progress'，"
-    "开始步骤 1（最好在同一回合内完成）。\n"
+    "**立即** `update_subtask_state`，subtask_idx=0、state='in_progress'，"
+    "开始执行（最好同一回合内完成）。\n"
 )
 
 _GOV_DOC_PIPELINE_NO_PLAN_SKIP_RETRIEVAL = (
     "当前尚无活动计划。\n"
     + _LANG_BLOCK
-    + "你处于 **公文 /plan 流水线**（自动执行；无需向用户确认）。"
-    "**已检测到用户提供的材料**（附件与/或正文中的明确来源线索）："
-    "**不要**再为取材料而执行知识库检索。\n"
-    "**请先判断**是否要「**新写一篇正式公文**」。**不需要**时：`create_plan` 按实际拆步，"
-    "执行时**按需**选用工具，勿套用下述四工具流水线。**需要**时：`create_plan` **恰好四个**"
-    "子任务，**严格**按下述顺序，每步只调用对应工具：\n"
-    "1) **用户材料（跳过检索）**：**不要**调用 `doc_retrieval`。"
-    "仅以用户消息与附件为参考输入；若仍无可用内容，则在外部材料为空的情况下继续。"
-    "调用 `finish_subtask` 给出简短结果。\n"
-    "2) **起草**：工具 `gov_document_writer` — 结合用户提供的材料、起草说明，"
-    "必要时结合用户记忆文件；响应仅为 JSON（``normalizedResult.document``），"
-    "勿含 ``savePath`` 或工作区落盘文件，禁止调用write_file工具写文件。\n"
-    "3) **审核**：工具 `doc_reviewer` — **必须**传入上一步写作工具返回的正文 "
-    "（``normalizedResult.document`` 或完整工具 JSON）；**禁止**臆造 "
-    "``file_path``/``path``；禁止调用write_file工具写文件；"
-    "**仅当**正文已在工作区存成真实文件并知道正确路径时，才可用 ``file_path`` / ``path``。\n"
-    "4) **版式**：每轮流水线对 `gov_document_layout` **只调用一次**，禁止调用write_file工具写文件。"
-    "且 **仅**传 ``template_title``（公文标题）。**不要**传 ``content``、"
-    "``file_path``，也勿再次调用该工具：该步 **仅** 获取版式推荐，**不** 写入 ``.docx``，"
-    "并返回非空的 ``savePath`` 字符串作为 **待定** 输出路径（文件名规则同此前；"
-    "文件可能尚未存在）。\n"
-    "`create_plan` 成功后 **不要** 请用户确认。"
-    "**立即**调用 `update_subtask_state`，subtask_idx=0、state='in_progress'，"
-    "开始步骤 1，且 **不要** 使用 `doc_retrieval`（最好在同一回合内完成）。\n"
+    + "你处于 **/plan 公文助手**（自动执行；无需向用户确认）。"
+    "**用户已提供参考材料**（附件与/或正文线索），**不要**为取材料而调用 "
+    "`doc_retrieval`。\n"
+    "**先判断真实意图（由窄到宽）**；窄场景规则同常规 /plan（仅审核→1 步 "
+    "`doc_reviewer`；仅版式→1 步 layout；仅起草→1 步 writer）。\n"
+    "仅当用户 **明确** 要完整正式文稿时，可建多步计划（**跳过检索**）：\n"
+    "① 消化用户材料（**不**调用 `doc_retrieval`，`finish_subtask` 简述）→ "
+    "② `gov_document_writer` → ③ `doc_reviewer` → ④ `gov_document_layout`。\n"
+    "步数按实际需要，**勿**机械凑满四步；诉求已满足即 `finish_plan`。\n\n"
+    "**工具要点**同常规 /plan（writer 勿落盘；reviewer 勿臆造 path；layout 仅 "
+    "``template_title``）。\n"
+    "`create_plan` 成功后 **立即** `update_subtask_state`，subtask_idx=0、"
+    "state='in_progress'，且 **不要** 使用 `doc_retrieval`。\n"
 )
 
 _GOV_DOC_PIPELINE_AT_START = (
     "当前计划：\n```\n{plan}\n```\n"
     + _LANG_BLOCK
-    + "**公文 /plan 流水线**：执行已预批准，**不要**在开始前提请用户确认、修改或等待。\n"
-    "**立即**调用 `update_subtask_state`，subtask_idx=0、state='in_progress'，"
-    "随后为该子任务调用工具执行。\n"
-    "若用户最新消息取消任务，调用 `finish_plan`，state='abandoned'。\n"
-    "若用户要求整套重来，先调用 `finish_plan`（abandoned），再调用 `create_plan`；"
-    "在未经确认流程前，勿用 `revise_current_plan` 做全盘重做。\n"
-    "**关键**：本回合至少包含一次工具调用，勿仅回复文字。\n"
+    + "**公文 /plan**：按 **已创建计划** 的步数与说明执行；**禁止**添加计划外工具或子任务。\n"
+    "执行已预批准，**不要**在开始前提请用户确认。\n"
+    "**立即** `update_subtask_state`，subtask_idx=0、state='in_progress'，"
+    "随后调用与本步目标一致的工具。\n"
+    "若用户最新消息取消任务 → `finish_plan`，state='abandoned'。\n"
+    "若用户要求整套重来 → 先 `finish_plan`（abandoned），再 `create_plan`。\n"
+    "用户诉求已在当前步完成时 → `finish_subtask` 后 **直接** `finish_plan`，"
+    "**勿**自动进入无关后续步。\n"
+    "**关键**：本回合至少包含一次工具调用。\n"
 )
 
 _GOV_DOC_PIPELINE_AT_START_SKIP_RETRIEVAL_SUFFIX = (
-    "**跳过检索模式**：子任务 0 **禁止**调用 `doc_retrieval`。"
-    "仅使用用户消息与附件；按需要完成子任务 0（计划工具 / `finish_subtask`），"
-    "再继续后续步骤。\n"
+    "**用户材料已就绪**：除非计划子任务 **明确** 要求检索，否则 **禁止** "
+    "`doc_retrieval`；以用户消息/附件为输入。\n"
 )
 
 # Strong ordering under explicit ``/plan`` when gov-doc auto-pipeline is off:
@@ -435,9 +511,10 @@ if _HAS_DEFAULT_HINT:
                 "_plan_just_mutated",
                 False,
             )
+            gov = nb is not None and getattr(nb, "_plan_gov_doc_pipeline", False)
 
             if n_ip == 0 and n_done == 0 and n_abn == 0:
-                if nb is not None and getattr(nb, "_plan_gov_doc_pipeline", False):
+                if gov:
                     out = _GOV_DOC_PIPELINE_AT_START.format(
                         plan=plan.to_markdown(),
                     )
@@ -458,8 +535,8 @@ if _HAS_DEFAULT_HINT:
                     subtask_name=plan.subtasks[ip_idx].name,
                     subtask=plan.subtasks[ip_idx].to_markdown(detailed=True),
                 )
-                if nb is not None and getattr(nb, "_plan_gov_doc_pipeline", False):
-                    return body + _gov_pipeline_tool_reminder(ip_idx, nb)
+                if gov:
+                    return body + _gov_pipeline_tool_reminder(ip_idx, plan, nb)
                 return body
 
             if n_done + n_abn == len(plan.subtasks):

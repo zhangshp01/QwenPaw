@@ -1134,3 +1134,151 @@ def test_workflow_passthrough_error_emits_tool_use_start_then_stop():
     assert lines[1]["type"] == "content_block_stop"
     assert lines[1]["payload"]["sourceState"] == "error"
     assert lines[1]["payload"]["errorDetail"] == "boom"
+
+
+def test_workflow_streams_document_deltas_from_tool_output_in_progress():
+    wf = AgentLoopWorkflowSseTransformer()
+    cid = "writer-stream"
+    partial = {
+        "skillName": "gov_document_writer",
+        "displayText": "进行中：公文写作",
+        "normalizedResult": {"document": "大数据", "source": "model_success"},
+    }
+    batch = "\n\n".join(
+        [
+            "data: "
+            + json.dumps(
+                {
+                    "object": "content",
+                    "status": "in_progress",
+                    "type": "data",
+                    "data": {
+                        "call_id": cid,
+                        "name": "gov_document_writer",
+                        "output": json.dumps(partial, ensure_ascii=False),
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+            "data: "
+            + json.dumps(
+                {
+                    "object": "content",
+                    "status": "in_progress",
+                    "type": "data",
+                    "data": {
+                        "call_id": cid,
+                        "name": "gov_document_writer",
+                        "output": json.dumps(
+                            {
+                                **partial,
+                                "normalizedResult": {
+                                    "document": "大数据局",
+                                    "source": "model_success",
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+        ]
+    )
+    out = wf.consume_passthrough_batch(batch)
+    lines = _parse_sse_data_lines(out)
+    starts = [x for x in lines if x.get("type") == "content_block_start"]
+    deltas = [x for x in lines if x.get("type") == "content_block_delta"]
+    assert len(starts) == 1
+    assert starts[0]["content_block"]["skillName"] == "gov_document_writer"
+    assert [d["delta"]["text"] for d in deltas] == ["大", "数", "据", "局"]
+
+
+def test_workflow_streams_document_deltas_from_tool_arguments_in_progress():
+    wf = AgentLoopWorkflowSseTransformer()
+    cid = "writer-args"
+    batch = "\n\n".join(
+        [
+            "data: "
+            + json.dumps(
+                {
+                    "object": "content",
+                    "status": "in_progress",
+                    "type": "data",
+                    "data": {
+                        "call_id": cid,
+                        "name": "gov_document_writer",
+                        "arguments": '{"content":"标题',
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+            "data: "
+            + json.dumps(
+                {
+                    "object": "content",
+                    "status": "in_progress",
+                    "type": "data",
+                    "data": {
+                        "call_id": cid,
+                        "name": "gov_document_writer",
+                        "arguments": '{"content":"标题正文"}',
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+        ]
+    )
+    out = wf.consume_passthrough_batch(batch)
+    deltas = [
+        x["delta"]["text"]
+        for x in _parse_sse_data_lines(out)
+        if x.get("type") == "content_block_delta"
+    ]
+    assert deltas == ["标", "题", "正", "文"]
+
+
+def test_workflow_completed_doc_reviewer_does_not_emit_document_deltas():
+    """doc_reviewer is non-streaming; only content_block_stop carries the final payload."""
+    wf = AgentLoopWorkflowSseTransformer()
+    cid = "review-done"
+    body = {
+        "skillName": "doc_reviewer",
+        "stepIndex": 9,
+        "displayText": "已完成：文档审核",
+        "normalizedResult": {"document": "审核稿", "source": "model_success"},
+        "resultList": [],
+    }
+    msg = {
+        "object": "message",
+        "status": "completed",
+        "type": "plugin_call_output",
+        "role": "tool",
+        "content": [
+            {
+                "object": "content",
+                "type": "data",
+                "data": {
+                    "call_id": cid,
+                    "name": "doc_reviewer",
+                    "output": json.dumps(body, ensure_ascii=False),
+                },
+            },
+        ],
+    }
+    out = wf.consume_passthrough_batch(
+        "data: " + json.dumps(msg, ensure_ascii=False) + "\n\n",
+    )
+    lines = _parse_sse_data_lines(out)
+    deltas = [
+        x["delta"]["text"]
+        for x in lines
+        if x.get("type") == "content_block_delta"
+    ]
+    stops = [x for x in lines if x.get("type") == "content_block_stop"]
+    assert deltas == []
+    assert stops[-1]["payload"]["normalizedResult"]["document"] == "审核稿"

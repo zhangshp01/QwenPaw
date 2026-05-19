@@ -12,6 +12,10 @@ block before opening a ``tool_use`` block; finish each ``tool_use`` with
 
 Whenever upstream sends ``status: in_progress`` for a tool/plan row, emit
 ``content_block_start`` (``tool_use``) so sub-agents / long steps are visible early;
+for ``gov_document_writer``, also emit ``content_block_delta``
+(``text_delta``) with incremental ``document`` text parsed from streaming tool
+``arguments`` or ``output`` before ``content_block_stop``. ``doc_reviewer`` does
+not stream document text (completion payload only).
 ``content_block_stop`` still carries the payload. If only ``completed`` is seen, start
 and stop are emitted back-to-back as before. The workflow SSE uses ``compact=false`` passthrough so ``content``/``data`` tool **completed**
 rows (with full ``output``) are not stripped before mapping. Identical repeat
@@ -35,6 +39,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from qwenpaw.agents.tools.gov_document_stream import (
+    document_from_tool_arguments,
+    document_from_tool_root,
+    document_stream_tool_names,
+)
+
 # Tools that should not surface as standalone workflow skills.
 _SKIP_WORKFLOW_TOOL_NAMES = frozenset(
     {
@@ -53,6 +63,8 @@ _GOV_ORDER_SKILLS: tuple[str, ...] = (
     "doc_reviewer",
     "gov_document_layout",
 )
+
+_DOCUMENT_STREAM_TOOLS = document_stream_tool_names()
 
 
 def _wf_line(obj: dict[str, Any]) -> str:
@@ -421,6 +433,17 @@ def _build_workflow_result_envelope(root: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _document_from_stream_tool_row(row: dict[str, Any]) -> str:
+    """Extract streamable document text from tool arguments or partial output."""
+    root = _tool_result_root(row.get("output"))
+    doc = document_from_tool_root(root)
+    if doc:
+        return doc
+    if "arguments" in row:
+        return document_from_tool_arguments(row.get("arguments"))
+    return ""
+
+
 def _stop_payload_from_tool_root(
     *,
     tool_name: str,
@@ -488,6 +511,8 @@ class AgentLoopWorkflowSseTransformer:
         # Tool names that already emitted a non-placeholder completion; stale deferred
         # placeholders for another call_id must not flush at stream end (duplicate stop).
         self._tool_emitted_substantial_completion: set[str] = set()
+        # Per (tool name, call_id): chars of ``document`` already sent as deltas.
+        self._tool_document_emitted_len: dict[tuple[str, str], int] = {}
 
     def _emit_error_content_block_sse(self, error_detail: str) -> str:
         """One paired ``tool_use`` block for passthrough errors (start + stop)."""
@@ -544,6 +569,38 @@ class AgentLoopWorkflowSseTransformer:
                 "delta": {"type": "text_delta", "text": text},
             },
         )
+
+    def _emit_tool_document_deltas(self, *, tool_key: tuple[str, str], document: str) -> str:
+        """Emit one ``text_delta`` per new Unicode character inside an open tool_use block."""
+        if not document:
+            return ""
+        prev = self._tool_document_emitted_len.get(tool_key, 0)
+        if len(document) <= prev:
+            return ""
+        parts: list[str] = []
+        for ch in document[prev:]:
+            parts.append(self._emit_text_delta(ch))
+        self._tool_document_emitted_len[tool_key] = len(document)
+        return "".join(parts)
+
+    def _ensure_tool_use_started(
+        self,
+        *,
+        tool_key: tuple[str, str],
+        protocol_skill: str,
+        root: dict[str, Any] | None,
+        parts: list[str],
+    ) -> None:
+        if tool_key in self._tool_use_started:
+            return
+        start_label = self._tool_use_start_label(protocol_skill, root)
+        parts.append(
+            self._emit_tool_use_start(
+                skill_name=protocol_skill,
+                display_text=start_label,
+            ),
+        )
+        self._tool_use_started.add(tool_key)
 
     def _emit_text_stop(self) -> str:
         if not self._text_block_open:
@@ -620,6 +677,17 @@ class AgentLoopWorkflowSseTransformer:
                         display_text=start_label,
                     ),
                 )
+        if name in _DOCUMENT_STREAM_TOOLS:
+            doc = _document_from_stream_tool_row(row)
+            doc_key = tool_key
+            if fallback_started_key is not None:
+                doc_key = fallback_started_key
+            parts.append(
+                self._emit_tool_document_deltas(
+                    tool_key=doc_key,
+                    document=doc,
+                ),
+            )
         parts.append(
             _wf_line(
                 {
@@ -737,16 +805,22 @@ class AgentLoopWorkflowSseTransformer:
             if tool_key in self._tool_completed_keys:
                 return ""
             parts.append(self._emit_text_stop())
-            if tool_key not in self._tool_use_started:
-                root_tip = _tool_result_root(row.get("output"))
-                start_label = self._tool_use_start_label(protocol_skill, root_tip)
+            root_tip = _tool_result_root(row.get("output"))
+            self._ensure_tool_use_started(
+                tool_key=tool_key,
+                protocol_skill=protocol_skill,
+                root=root_tip,
+                parts=parts,
+            )
+            if name in _DOCUMENT_STREAM_TOOLS:
+                doc = _document_from_stream_tool_row(row)
                 parts.append(
-                    self._emit_tool_use_start(
-                        skill_name=protocol_skill,
-                        display_text=start_label,
+                    self._emit_tool_document_deltas(
+                        tool_key=tool_key,
+                        document=doc,
                     ),
                 )
-                self._tool_use_started.add(tool_key)
+            return "".join(parts)
 
         if status == "completed":
             root = _tool_result_root(row.get("output"))
