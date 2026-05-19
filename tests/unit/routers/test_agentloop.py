@@ -4,15 +4,32 @@ from __future__ import annotations
 
 import json
 
+from agentscope_runtime.engine.schemas.agent_schemas import (
+    DataContent,
+    FunctionCall,
+    FunctionCallOutput,
+    Message,
+    MessageType,
+    TextContent,
+)
+
+import asyncio
+
 from qwenpaw.app.routers.agentloop import (
     AgentLoopResponse,
     ConversationRunRequest,
     _AgentLoopSseTerminalDeduper,
     _AgentLoopSseToolStreamDeduper,
     _build_run_input_dict,
+    _last_run_id_from_chat,
     _passthrough_agentloop_sse_chunk,
     _passthrough_console_sse_chunk,
+    _run_belongs_to_conversation,
     _slim_agentloop_sse_payload,
+)
+from qwenpaw.app.workspace.agentloop_run_registry import AgentLoopRunRegistry
+from qwenpaw.app.routers.agentloop_conversation_detail import (
+    build_conversation_detail,
 )
 from qwenpaw.app.routers.agentloop_workflow_sse import (
     AgentLoopWorkflowSseTransformer,
@@ -1282,3 +1299,294 @@ def test_workflow_completed_doc_reviewer_does_not_emit_document_deltas():
     stops = [x for x in lines if x.get("type") == "content_block_stop"]
     assert deltas == []
     assert stops[-1]["payload"]["normalizedResult"]["document"] == "审核稿"
+
+
+def _msg(
+    *,
+    role: str,
+    mtype: MessageType,
+    metadata: dict | None = None,
+) -> Message:
+    m = Message(type=mtype, role=role)
+    m.metadata = metadata or {}
+    return m
+
+
+def test_build_conversation_detail_user_and_plain_assistant():
+    from datetime import datetime, timezone
+
+    chat = ChatSpec(
+        id="59fb02af-2b68-411d-bb9b-bee412223d94",
+        name="测试会话",
+        session_id="agentloop:59fb02af",
+        user_id="u1",
+        channel="console",
+        created_at=datetime(2026, 4, 30, 0, 51, 2, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 4, 30, 0, 52, 40, tzinfo=timezone.utc),
+    )
+    user = _msg(role="user", mtype=MessageType.MESSAGE, metadata={"original_id": "msg_u1"})
+    user.add_content(TextContent(delta=False, index=None, text="11"))
+    assistant = _msg(
+        role="assistant",
+        mtype=MessageType.MESSAGE,
+        metadata={"original_id": "msg_a1"},
+    )
+    assistant.add_content(
+        TextContent(delta=False, index=None, text="您好，有什么可以帮您？"),
+    )
+    detail = build_conversation_detail(
+        chat,
+        [user.completed(), assistant.completed()],
+        model="Qwen3-235B-A22B-FP8",
+    )
+    assert detail["id"] == chat.id
+    assert detail["title"] == "测试会话"
+    assert len(detail["messages"]) == 2
+    assert detail["messages"][0]["role"] == "user"
+    assert detail["messages"][0]["content"] == {"text": "11"}
+    assert detail["messages"][1]["content"]["text"].startswith("您好")
+    assert detail["messages"][1]["content"]["model"] == "Qwen3-235B-A22B-FP8"
+    assert detail["artifacts"] == []
+
+
+def test_build_conversation_detail_pipeline_steps():
+    from datetime import datetime, timezone
+
+    chat = ChatSpec(
+        id="59fb02af-2b68-411d-bb9b-bee412223d94",
+        name="帮我写一篇关于大数据局的公文",
+        session_id="agentloop:59fb02af",
+        user_id="u1",
+        channel="console",
+        created_at=datetime(2026, 4, 30, 0, 51, 2, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 4, 30, 0, 52, 40, tzinfo=timezone.utc),
+    )
+    user = _msg(role="user", mtype=MessageType.MESSAGE, metadata={"original_id": "msg_u1"})
+    user.add_content(
+        TextContent(
+            delta=False,
+            index=None,
+            text="/plan 帮我写一篇关于大数据局的公文",
+        ),
+    )
+    plan_call = _msg(role="assistant", mtype=MessageType.PLUGIN_CALL)
+    plan_call.add_content(
+        DataContent(
+            delta=False,
+            index=None,
+            data=FunctionCall(
+                call_id="plan-1",
+                name="create_plan",
+                arguments=json.dumps(
+                    {
+                        "subtasks": [
+                            {
+                                "name": "资料检索",
+                                "description": "检索大数据局职责资料",
+                            },
+                            {
+                                "name": "公文写作",
+                                "description": "撰写公文正文",
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            ).model_dump(),
+        ),
+    )
+    retrieval_out = _msg(role="system", mtype=MessageType.PLUGIN_CALL_OUTPUT)
+    retrieval_body = {
+        "skillName": "doc_retrieval",
+        "stepIndex": 1,
+        "sourceState": "legacy_success",
+        "normalizedResult": {
+            "source": "legacy_success",
+            "items": [{"title": "大数据局职责.txt", "description": "职责摘要"}],
+            "itemsTotal": 1,
+        },
+    }
+    retrieval_out.add_content(
+        DataContent(
+            delta=False,
+            index=None,
+            data=FunctionCallOutput(
+                call_id="r1",
+                name="doc_retrieval",
+                output=json.dumps(
+                    [{"type": "json", "json": retrieval_body}],
+                    ensure_ascii=False,
+                ),
+            ).model_dump(exclude_none=True),
+        ),
+    )
+    writer_out = _msg(role="system", mtype=MessageType.PLUGIN_CALL_OUTPUT)
+    writer_body = {
+        "skillName": "gov_document_writer",
+        "stepIndex": 2,
+        "sourceState": "model_success",
+        "normalizedResult": {
+            "document": "关于数据工作的通知\n\n正文内容。",
+            "source": "model_success",
+        },
+    }
+    writer_out.add_content(
+        DataContent(
+            delta=False,
+            index=None,
+            data=FunctionCallOutput(
+                call_id="w1",
+                name="gov_document_writer",
+                output=json.dumps(
+                    [{"type": "json", "json": writer_body}],
+                    ensure_ascii=False,
+                ),
+            ).model_dump(exclude_none=True),
+        ),
+    )
+    detail = build_conversation_detail(
+        chat,
+        [
+            user.completed(),
+            plan_call.completed(),
+            retrieval_out.completed(),
+            writer_out.completed(),
+        ],
+        model="Qwen3-235B-A22B-FP8",
+    )
+    assert len(detail["messages"]) == 2
+    assistant = detail["messages"][1]
+    assert assistant["role"] == "assistant"
+    content = assistant["content"]
+    assert content["model"] == "Qwen3-235B-A22B-FP8"
+    assert content["planIntent"] == "document_workflow"
+    assert "2 个 sub-agent 步骤" in content["planSummary"]
+    steps = content["steps"]
+    assert len(steps) == 2
+    assert steps[0]["skillName"] == "retrieval"
+    assert steps[0]["title"] == "资料检索"
+    assert steps[0]["taskId"].startswith("task_59fb02af_")
+    assert steps[0]["normalizedResult"]["items"][0]["title"] == "大数据局职责.txt"
+    assert steps[1]["skillName"] == "writing"
+    assert "document" in steps[1]["normalizedResult"]
+
+
+def test_build_conversation_detail_review_only_step():
+    from datetime import datetime, timezone
+
+    chat = ChatSpec(
+        id="adbc179f-1db6-465c-9514-95f2157767d2",
+        name="审核",
+        session_id="agentloop:adbc179f",
+        user_id="u1",
+        channel="console",
+        created_at=datetime(2026, 4, 30, 1, 0, 0, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 4, 30, 1, 1, 0, tzinfo=timezone.utc),
+    )
+    user = _msg(role="user", mtype=MessageType.MESSAGE)
+    user.add_content(
+        TextContent(
+            delta=False,
+            index=None,
+            text="[skill:doc-reviewer]\n请帮我审核如下信息：原文。",
+        ),
+    )
+    review_out = _msg(role="system", mtype=MessageType.PLUGIN_CALL_OUTPUT)
+    review_body = {
+        "skillName": "doc_reviewer",
+        "stepIndex": 1,
+        "sourceState": "model_success",
+        "normalizedResult": {
+            "document": "修订后正文。",
+            "source": "model_success",
+        },
+        "resultList": [{"errorWord": "错", "rightWord": "对"}],
+    }
+    review_out.add_content(
+        DataContent(
+            delta=False,
+            index=None,
+            data=FunctionCallOutput(
+                call_id="rev1",
+                name="doc_reviewer",
+                output=json.dumps(
+                    [{"type": "json", "json": review_body}],
+                    ensure_ascii=False,
+                ),
+            ).model_dump(exclude_none=True),
+        ),
+    )
+    assistant = _msg(role="assistant", mtype=MessageType.MESSAGE)
+    assistant.add_content(
+        TextContent(delta=False, index=None, text="审核完成，请查看。"),
+    )
+    detail = build_conversation_detail(
+        chat,
+        [user.completed(), review_out.completed(), assistant.completed()],
+    )
+    assert detail["messages"][0]["content"]["text"] == "请帮我审核如下信息：原文。"
+    assert len(detail["messages"]) == 3
+    pipeline = detail["messages"][1]["content"]["steps"]
+    assert len(pipeline) == 1
+    assert pipeline[0]["skillName"] == "review"
+    assert detail["messages"][2]["content"]["text"] == "审核完成，请查看。"
+
+
+def test_agentloop_run_registry_register_and_resolve():
+    async def _exercise() -> None:
+        registry = AgentLoopRunRegistry()
+        await registry.register("run-a", "conv-1")
+        assert await registry.resolve_conversation("run-a") == "conv-1"
+        assert await registry.resolve_conversation("missing") is None
+
+    asyncio.run(_exercise())
+
+
+def test_last_run_id_from_chat_meta():
+    chat = ChatSpec(
+        id="c1",
+        name="t",
+        session_id="agentloop:c1",
+        user_id="u1",
+        channel="console",
+        meta={"lastRunId": "  run-xyz  "},
+    )
+    assert _last_run_id_from_chat(chat) == "run-xyz"
+    assert _last_run_id_from_chat(
+        ChatSpec(
+            id="c2",
+            name="t",
+            session_id="s",
+            user_id="u",
+            channel="console",
+        ),
+    ) is None
+
+
+def test_run_belongs_to_conversation_registry_meta_and_history():
+    chat = ChatSpec(
+        id="conv-1",
+        name="t",
+        session_id="agentloop:conv-1",
+        user_id="u1",
+        channel="console",
+        meta={
+            "lastRunId": "run-latest",
+            "agentloopRunIds": ["run-old", "run-latest"],
+        },
+    )
+    assert _run_belongs_to_conversation(
+        chat,
+        "run-latest",
+        registry_conversation_id="conv-1",
+    )
+    assert _run_belongs_to_conversation(
+        chat,
+        "run-old",
+        registry_conversation_id=None,
+    )
+    assert not _run_belongs_to_conversation(
+        chat,
+        "run-other",
+        registry_conversation_id=None,
+    )

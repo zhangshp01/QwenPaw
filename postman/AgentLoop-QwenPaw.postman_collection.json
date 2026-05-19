@@ -23,6 +23,10 @@
       "value": ""
     },
     {
+      "key": "runId",
+      "value": ""
+    },
+    {
       "key": "nodeId",
       "value": ""
     },
@@ -213,8 +217,8 @@
                 "value": "text/event-stream"
               }
             ],
-            "url": "{{baseUrl}}/api/agentloop/conversations/{{conversationId}}/events?run_id={{conversationId}}",
-            "description": "需在「Run conversation」返回后、任务仍在进行时请求；`run_id` 与当前实现中的 `conversationId` 一致。"
+            "url": "{{baseUrl}}/api/agentloop/conversations/{{conversationId}}/events?run_id={{runId}}",
+            "description": "需在「Run conversation」返回后、任务仍在进行时请求；`run_id` 使用 Run 响应中的 `data.runId`（每次 run 新生成的 UUID，与 conversationId 不同）。"
           }
         }
       ]

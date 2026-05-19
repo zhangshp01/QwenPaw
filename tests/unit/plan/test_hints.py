@@ -20,8 +20,10 @@ def test_infer_gov_tool_review_before_write():
 def test_no_plan_hint_does_not_require_four_steps():
     assert "恰好 4" not in _GOV_DOC_PIPELINE_NO_PLAN
     assert "必须恰好" not in _GOV_DOC_PIPELINE_NO_PLAN
-    assert "仅审核" in _GOV_DOC_PIPELINE_NO_PLAN
+    assert "窄 · 仅审核" in _GOV_DOC_PIPELINE_NO_PLAN
     assert "1 个子任务" in _GOV_DOC_PIPELINE_NO_PLAN
+    assert "必须 4 个子任务" in _GOV_DOC_PIPELINE_NO_PLAN
+    assert "doc_retrieval" in _GOV_DOC_PIPELINE_NO_PLAN
 
 
 def test_tool_reminder_follows_subtask_text_not_index():

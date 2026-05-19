@@ -27,6 +27,7 @@ from .service_factories import (
 )
 from ..runner import AgentRunner
 from ..runner.task_tracker import TaskTracker
+from .agentloop_run_registry import AgentLoopRunRegistry
 from ..mcp import MCPClientManager
 from ..crons.manager import CronManager
 from ..crons.repo.json_repo import JsonJobRepository
@@ -67,6 +68,7 @@ class Workspace:
         self._started = False
         self._manager = None  # Reference to MultiAgentManager
         self._task_tracker = TaskTracker()
+        self._agentloop_run_registry = AgentLoopRunRegistry()
 
         # Register all services
         self._register_services()
@@ -116,6 +118,11 @@ class Workspace:
     def task_tracker(self) -> TaskTracker:
         """Get task tracker for background chat and reconnect."""
         return self._task_tracker
+
+    @property
+    def agentloop_run_registry(self) -> AgentLoopRunRegistry:
+        """Maps AgentLoop run_id to conversation_id for SSE subscription."""
+        return self._agentloop_run_registry
 
     @property
     def config(self):

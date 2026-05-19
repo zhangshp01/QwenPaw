@@ -43,10 +43,12 @@ from ..runner.api import get_chat_manager, get_session, get_workspace
 from ..runner.utils import agentscope_msg_to_message
 from ..runner.models import ChatSpec, ChatUpdate
 from ...providers.provider_manager import ProviderManager
+from .agentloop_conversation_detail import build_conversation_detail
 from .agentloop_workflow_sse import (
     AgentLoopWorkflowSseTransformer,
     workflow_message_start_sse,
 )
+from ..workspace.workspace import Workspace
 
 # ---------------------------------------------------------------------------
 # Envelope & request bodies (aligned with govdoc-agent ``app/schemas.py``)
@@ -141,6 +143,60 @@ def _not_implemented(feature: str) -> AgentLoopResponse:
         ),
         data=None,
     )
+
+
+_AGENTLOOP_RUN_IDS_META_KEY = "agentloopRunIds"
+_AGENTLOOP_LAST_RUN_META_KEY = "lastRunId"
+_AGENTLOOP_RUN_HISTORY_LIMIT = 50
+
+
+def _chat_meta_dict(chat: ChatSpec) -> dict[str, Any]:
+    meta = chat.meta
+    return meta if isinstance(meta, dict) else {}
+
+
+def _last_run_id_from_chat(chat: ChatSpec) -> str | None:
+    raw = _chat_meta_dict(chat).get(_AGENTLOOP_LAST_RUN_META_KEY)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def _run_belongs_to_conversation(
+    chat: ChatSpec,
+    run_id: str,
+    *,
+    registry_conversation_id: str | None,
+) -> bool:
+    if registry_conversation_id == chat.id:
+        return True
+    meta = _chat_meta_dict(chat)
+    if meta.get(_AGENTLOOP_LAST_RUN_META_KEY) == run_id:
+        return True
+    history = meta.get(_AGENTLOOP_RUN_IDS_META_KEY)
+    return isinstance(history, list) and run_id in history
+
+
+async def _register_agentloop_run(
+    workspace: Workspace,
+    mgr: ChatManager,
+    chat: ChatSpec,
+    run_id: str,
+) -> None:
+    await workspace.agentloop_run_registry.register(run_id, chat.id)
+    meta = dict(_chat_meta_dict(chat))
+    meta[_AGENTLOOP_LAST_RUN_META_KEY] = run_id
+    history = list(meta.get(_AGENTLOOP_RUN_IDS_META_KEY) or [])
+    if run_id not in history:
+        history.append(run_id)
+    meta[_AGENTLOOP_RUN_IDS_META_KEY] = history[-_AGENTLOOP_RUN_HISTORY_LIMIT:]
+    merged = chat.model_copy(
+        update={
+            "meta": meta,
+            "updated_at": datetime.now(timezone.utc),
+        },
+    )
+    await mgr.create_chat(merged)
 
 
 def _resolve_agentloop_user_id(request: Request) -> str:
@@ -651,16 +707,17 @@ async def list_conversations(
             if delta.total_seconds() < 120
             else item.updated_at.strftime("%m月%d日 %H:%M")
         )
-        data.append(
-            {
-                "id": item.id,
-                "title": item.name,
-                "pinned": item.pinned,
-                "updatedAt": item.updated_at.isoformat(),
-                "lastRunId": item.id,
-                "meta": meta,
-            },
-        )
+        entry: dict[str, Any] = {
+            "id": item.id,
+            "title": item.name,
+            "pinned": item.pinned,
+            "updatedAt": item.updated_at.isoformat(),
+            "meta": meta,
+        }
+        last_run_id = _last_run_id_from_chat(item)
+        if last_run_id is not None:
+            entry["lastRunId"] = last_run_id
+        data.append(entry)
     return AgentLoopResponse(data=data)
 
 
@@ -695,6 +752,22 @@ async def _get_owned_chat_or_404(
     return chat
 
 
+def _resolve_conversation_model(workspace: Any, chat: ChatSpec) -> str | None:
+    """Best-effort model label for conversation detail (optional)."""
+    meta = chat.meta if isinstance(chat.meta, dict) else {}
+    for key in ("lastModel", "model", "defaultModel"):
+        val = meta.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    cfg = getattr(workspace, "config", None)
+    active = getattr(cfg, "active_model", None) if cfg is not None else None
+    if active is not None:
+        model_id = getattr(active, "model", None)
+        if isinstance(model_id, str) and model_id.strip():
+            return model_id.strip()
+    return None
+
+
 @conversations_router.get("/{conversation_id}", response_model=AgentLoopResponse)
 async def get_conversation(
     request: Request,
@@ -706,39 +779,16 @@ async def get_conversation(
     uid = _resolve_agentloop_user_id(request)
     chat = await _get_owned_chat_or_404(mgr, conversation_id, uid)
     state = await session.get_session_state_dict(chat.session_id, chat.user_id)
-    status = await workspace.task_tracker.get_status(chat.id)
-    messages_out: list[dict[str, Any]] = []
+    messages_out: list[Message] = []
     if state:
         memory_state = state.get("agent", {}).get("memory", {})
         memory = InMemoryMemory()
         memory.load_state_dict(memory_state, strict=False)
         memories = await memory.get_memory(prepend_summary=False)
-        runtime_msgs = agentscope_msg_to_message(memories)
-        for i, m in enumerate(runtime_msgs):
-            messages_out.append(
-                _runtime_message_to_govdoc(m, seq=i, run_id=chat.id),
-            )
-    return AgentLoopResponse(
-        data={
-            "id": chat.id,
-            "title": chat.name,
-            "pinned": chat.pinned,
-            "runningContext": {},
-            "pendingPromptMenu": None,
-            "taskTree": [],
-            "messageActions": {
-                "canCopy": True,
-                "canLike": True,
-                "canDislike": True,
-                "canRegenerate": True,
-            },
-            "stepOutcomes": [],
-            "messages": messages_out,
-            "artifacts": [],
-            "compressionSnapshots": [],
-            "status": status,
-        },
-    )
+        messages_out = agentscope_msg_to_message(memories)
+    model = _resolve_conversation_model(workspace, chat)
+    detail = build_conversation_detail(chat, messages_out, model=model)
+    return AgentLoopResponse(data=detail)
 
 
 @conversations_router.put("/{conversation_id}", response_model=AgentLoopResponse)
@@ -812,24 +862,27 @@ async def run_conversation(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    run_id = str(uuid.uuid4())
     tracker = workspace.task_tracker
     queue, is_new = await tracker.attach_or_start(
-        chat.id,
+        run_id,
         native_payload,
         console_channel.stream_one,
     )
     if is_new:
-        await tracker.detach_subscriber(chat.id, queue)
+        await tracker.detach_subscriber(run_id, queue)
+
+    await _register_agentloop_run(workspace, mgr, chat, run_id)
 
     stream_url = (
-        f"/api/agentloop/conversations/{chat.id}/events?run_id={chat.id}"
+        f"/api/agentloop/conversations/{chat.id}/events?run_id={run_id}"
     )
     return AgentLoopResponse(
         data={
             "conversationId": chat.id,
             "conversationTitle": chat.name,
-            "runId": chat.id,
-            "taskId": chat.id,
+            "runId": run_id,
+            "taskId": run_id,
             "streamUrl": stream_url,
             "assistantMessage": None,
             "artifacts": [],
@@ -861,21 +914,34 @@ async def stream_conversation_events(
     mgr = workspace.chat_manager
     uid = _resolve_agentloop_user_id(request)
     conversation_id = conversation_id.strip()
-    rid = run_id.strip() if isinstance(run_id, str) else run_id
+    rid = run_id.strip() if isinstance(run_id, str) and run_id.strip() else None
     chat = await _get_owned_chat_or_404(mgr, conversation_id, uid)
-    key = rid or chat.id
-    if key != chat.id:
-        raise HTTPException(status_code=400, detail="run_id mismatch for this server")
+    if rid is None:
+        rid = _last_run_id_from_chat(chat)
+    if rid is None:
+        raise HTTPException(status_code=400, detail="run_id is required")
+
+    registry = workspace.agentloop_run_registry
+    owner = await registry.resolve_conversation(rid)
+    if not _run_belongs_to_conversation(
+        chat,
+        rid,
+        registry_conversation_id=owner,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="run_id does not belong to this conversation",
+        )
 
     tracker = workspace.task_tracker
-    queue = await tracker.attach(chat.id)
+    queue = await tracker.attach(rid)
     if queue is None:
         raise HTTPException(status_code=404, detail="暂无运行记录")
 
     use_legacy = event_format.strip().lower() == "legacy"
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        stream_it = tracker.stream_from_queue(queue, chat.id)
+        stream_it = tracker.stream_from_queue(queue, rid)
         if use_legacy:
             deduper = _AgentLoopSseTerminalDeduper()
             tool_stream_deduper = _AgentLoopSseToolStreamDeduper()
