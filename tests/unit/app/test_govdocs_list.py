@@ -5,8 +5,12 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 
+import io
+import zipfile
+
 from qwenpaw.app.workspace_paths import (
     annotate_govdocs_user,
+    build_workspace_files_zip,
     delete_govdocs_file,
     delete_govdocs_files_batch,
     filter_govdocs_by_filename,
@@ -16,6 +20,7 @@ from qwenpaw.app.workspace_paths import (
     rename_govdocs_file,
     resolve_govdocs_file_path,
     resolve_unique_govdocs_dest,
+    resolve_workspace_download_files,
     resolve_workspace_upload_directory,
     save_upload_to_workspace_directory,
     sort_govdocs_by_modified_time,
@@ -208,6 +213,39 @@ def test_save_upload_unique_name_when_exists(tmp_path: Path):
     entry = save_upload_to_workspace_directory(target_dir, "dup.docx", b"new")
     assert entry["filename"] == "dup - 副本.docx"
     assert (gov / "dup - 副本.docx").read_bytes() == b"new"
+
+
+def test_resolve_workspace_download_files_single_and_zip(tmp_path: Path):
+    ws = tmp_path / "agent"
+    gov = ws / "govdocs"
+    gov.mkdir(parents=True)
+    a = gov / "a.docx"
+    b = gov / "b.docx"
+    a.write_bytes(b"aaa")
+    b.write_bytes(b"bbb")
+
+    one = resolve_workspace_download_files([str(a)], ws)
+    assert len(one) == 1
+    assert one[0].name == "a.docx"
+
+    both = resolve_workspace_download_files(
+        [str(a), "govdocs/b.docx"],
+        ws,
+    )
+    assert len(both) == 2
+
+    buf = build_workspace_files_zip(ws, both)
+    with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
+        names = sorted(zf.namelist())
+    assert names == ["govdocs/a.docx", "govdocs/b.docx"]
+
+
+def test_resolve_workspace_download_files_missing(tmp_path: Path):
+    ws = tmp_path / "agent"
+    ws.mkdir()
+    with pytest.raises(HTTPException) as exc_info:
+        resolve_workspace_download_files(["govdocs/missing.docx"], ws)
+    assert exc_info.value.status_code == 404
 
 
 def test_resolve_workspace_upload_directory_rejects_outside(tmp_path: Path):

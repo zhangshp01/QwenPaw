@@ -30,7 +30,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from agentscope_runtime.engine.schemas.agent_schemas import Message
@@ -51,7 +51,10 @@ from ..workspace_paths import (
     list_govdocs_files,
     paginate_govdocs_list,
     rename_govdocs_file,
+    build_workspace_files_zip,
+    mime_type_for_suffix,
     resolve_govdocs_file_path,
+    resolve_workspace_download_files,
     resolve_workspace_upload_directory,
     resolve_workspace_write_path,
     save_upload_to_workspace_directory,
@@ -168,6 +171,18 @@ class WorkspaceGovdocBatchDeleteRequest(BaseModel):
         ...,
         min_length=1,
         description="File paths (relative under govdocs/ or absolute under workspace)",
+    )
+
+
+class WorkspaceDownloadRequest(BaseModel):
+    """Download one or more files from the agent workspace."""
+
+    path: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "File path(s) under workspace (relative or absolute under workspace)"
+        ),
     )
 
 
@@ -1187,9 +1202,57 @@ async def workspace_send_to_conversation(node_id: str) -> AgentLoopResponse:  # 
     return _not_implemented("send-to-conversation")
 
 
-@workspace_router.get("/download/{node_id}")
-async def workspace_download(node_id: str) -> None:  # noqa: ARG001
-    raise HTTPException(status_code=501, detail="Workspace download not implemented")
+@workspace_router.post(
+    "/download",
+    response_model=None,
+    summary="Download one or more workspace files",
+    responses={
+        200: {
+            "content": {
+                "application/octet-stream": {},
+                "application/zip": {},
+            },
+        },
+    },
+)
+@workspace_router.post(
+    "/download/",
+    include_in_schema=False,
+    response_model=None,
+)
+async def workspace_download_files(
+    request: Request,
+    body: WorkspaceDownloadRequest,
+):
+    """Download workspace file(s). Single file streams directly; multiple become a zip."""
+    workspace = await get_agent_for_request(request)
+    files = await asyncio.to_thread(
+        resolve_workspace_download_files,
+        body.path,
+        workspace.workspace_dir,
+    )
+
+    if len(files) == 1:
+        target = files[0]
+        return FileResponse(
+            target,
+            filename=target.name,
+            media_type=mime_type_for_suffix(target.suffix),
+        )
+
+    buf = await asyncio.to_thread(
+        build_workspace_files_zip,
+        workspace.workspace_dir,
+        files,
+    )
+    zip_name = f"workspace_download_{workspace.agent_id}.zip"
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{zip_name}"',
+        },
+    )
 
 
 @workspace_router.post("/uploads", response_model=AgentLoopResponse)

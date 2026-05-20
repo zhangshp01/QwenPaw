@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import io
 import logging
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,10 @@ MAX_GOVDOCS_DETAIL_CONTENT_BYTES = 10 * 1024 * 1024
 
 # Max binary payload for ``PUT /api/agentloop/workspace/files_binary`` (50 MiB).
 MAX_WORKSPACE_BINARY_WRITE_BYTES = 50 * 1024 * 1024
+
+# Max files and total bytes per ``GET /api/agentloop/workspace/download``.
+MAX_WORKSPACE_DOWNLOAD_FILES = 100
+MAX_WORKSPACE_DOWNLOAD_TOTAL_BYTES = 200 * 1024 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +138,85 @@ def save_upload_to_workspace_directory(
     dest = resolve_unique_govdocs_dest(directory, safe_name)
     write_bytes_to_path(dest, data)
     return _file_entry(dest)
+
+
+def mime_type_for_suffix(suffix: str) -> str:
+    """Return Content-Type for a file suffix."""
+    return _mime_for_suffix(suffix)
+
+
+def resolve_workspace_download_file(
+    path_str: str,
+    workspace_dir: Path,
+) -> Path:
+    """Resolve *path_str* to an existing regular file under *workspace_dir*."""
+    target = resolve_workspace_write_path(path_str, workspace_dir)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"File not found: {path_str}")
+    return target.resolve()
+
+
+def resolve_workspace_download_files(
+    path_strings: list[str],
+    workspace_dir: Path,
+) -> list[Path]:
+    """Resolve and de-duplicate download targets; enforce count and size limits."""
+    if not path_strings:
+        raise HTTPException(status_code=400, detail="At least one path is required")
+    if len(path_strings) > MAX_WORKSPACE_DOWNLOAD_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"At most {MAX_WORKSPACE_DOWNLOAD_FILES} paths per request",
+        )
+
+    seen: set[str] = set()
+    files: list[Path] = []
+    total_bytes = 0
+
+    for raw in path_strings:
+        label = (raw or "").strip()
+        if not label:
+            raise HTTPException(status_code=400, detail="Path must not be empty")
+        target = resolve_workspace_download_file(label, workspace_dir)
+        key = str(target)
+        if key in seen:
+            continue
+        seen.add(key)
+        total_bytes += target.stat().st_size
+        if total_bytes > MAX_WORKSPACE_DOWNLOAD_TOTAL_BYTES:
+            limit_mb = MAX_WORKSPACE_DOWNLOAD_TOTAL_BYTES // (1024 * 1024)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Total download size exceeds {limit_mb} MB",
+            )
+        files.append(target)
+
+    if not files:
+        raise HTTPException(status_code=400, detail="No valid file paths provided")
+    return files
+
+
+def build_workspace_files_zip(
+    workspace_dir: Path,
+    files: list[Path],
+) -> io.BytesIO:
+    """Zip *files* using paths relative to *workspace_dir* as archive names."""
+    workspace_root = workspace_dir.expanduser().resolve()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        used_arcnames: set[str] = set()
+        for file_path in files:
+            try:
+                arcname = file_path.relative_to(workspace_root).as_posix()
+            except ValueError:
+                arcname = file_path.name
+            if arcname in used_arcnames:
+                parent = file_path.parent.name or "files"
+                arcname = f"{parent}/{file_path.name}"
+            used_arcnames.add(arcname)
+            zf.write(file_path, arcname)
+    buf.seek(0)
+    return buf
 
 
 def _govdocs_dir(workspace_dir: Path) -> Path:

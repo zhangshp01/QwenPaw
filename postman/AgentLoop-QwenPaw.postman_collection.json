@@ -338,9 +338,16 @@
         {
           "name": "Download",
           "request": {
-            "method": "GET",
-            "header": [{ "key": "X-Agent-Id", "value": "{{agentId}}" }],
-            "url": "{{baseUrl}}/api/agentloop/workspace/download/{{nodeId}}"
+            "method": "POST",
+            "header": [
+              { "key": "X-Agent-Id", "value": "{{agentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"path\": [\"govdocs/example.docx\"]\n}"
+            },
+            "url": "{{baseUrl}}/api/agentloop/workspace/download"
           }
         },
         {
