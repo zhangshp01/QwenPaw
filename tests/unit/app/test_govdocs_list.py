@@ -16,6 +16,8 @@ from qwenpaw.app.workspace_paths import (
     rename_govdocs_file,
     resolve_govdocs_file_path,
     resolve_unique_govdocs_dest,
+    resolve_workspace_upload_directory,
+    save_upload_to_workspace_directory,
     sort_govdocs_by_modified_time,
 )
 
@@ -182,6 +184,40 @@ def test_batch_delete_govdocs_files(tmp_path: Path):
     assert not a.exists()
     assert not b.exists()
     assert result["failed"][0]["path"] == missing
+
+
+def test_save_upload_to_workspace_directory(tmp_path: Path):
+    ws = tmp_path / "agent"
+    gov = ws / "govdocs"
+    entry = save_upload_to_workspace_directory(
+        resolve_workspace_upload_directory(str(gov), ws),
+        "sample.docx",
+        b"docx-content",
+    )
+    assert entry["filename"] == "sample.docx"
+    assert (gov / "sample.docx").read_bytes() == b"docx-content"
+    assert entry["suffix"] == ".docx"
+
+
+def test_save_upload_unique_name_when_exists(tmp_path: Path):
+    ws = tmp_path / "agent"
+    gov = ws / "govdocs"
+    gov.mkdir(parents=True)
+    (gov / "dup.docx").write_bytes(b"old")
+    target_dir = resolve_workspace_upload_directory(str(gov), ws)
+    entry = save_upload_to_workspace_directory(target_dir, "dup.docx", b"new")
+    assert entry["filename"] == "dup - 副本.docx"
+    assert (gov / "dup - 副本.docx").read_bytes() == b"new"
+
+
+def test_resolve_workspace_upload_directory_rejects_outside(tmp_path: Path):
+    ws = tmp_path / "agent"
+    ws.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with pytest.raises(HTTPException) as exc_info:
+        resolve_workspace_upload_directory(str(outside), ws)
+    assert exc_info.value.status_code == 403
 
 
 def test_rename_uses_copy_when_target_exists(tmp_path: Path):

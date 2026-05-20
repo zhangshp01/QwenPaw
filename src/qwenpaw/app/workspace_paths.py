@@ -98,6 +98,42 @@ def resolve_workspace_write_path(path_str: str, workspace_dir: Path) -> Path:
     return target
 
 
+def resolve_workspace_upload_directory(
+    directory_str: str,
+    workspace_dir: Path,
+) -> Path:
+    """Resolve *directory_str* to a directory path under *workspace_dir*."""
+    target = resolve_workspace_write_path(directory_str, workspace_dir)
+    if target.exists() and not target.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail="directory must refer to a directory, not a file",
+        )
+    return target
+
+
+def save_upload_to_workspace_directory(
+    directory: Path,
+    upload_filename: str,
+    data: bytes,
+) -> dict[str, Any]:
+    """Write uploaded bytes into *directory* using a safe, unique file name."""
+    safe_name = Path((upload_filename or "").strip()).name
+    if not safe_name or safe_name in {".", ".."}:
+        raise HTTPException(status_code=400, detail="Upload filename must not be empty")
+
+    directory.mkdir(parents=True, exist_ok=True)
+    if not directory.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail="directory must refer to a directory, not a file",
+        )
+
+    dest = resolve_unique_govdocs_dest(directory, safe_name)
+    write_bytes_to_path(dest, data)
+    return _file_entry(dest)
+
+
 def _govdocs_dir(workspace_dir: Path) -> Path:
     return workspace_dir.expanduser().resolve() / GOVDOCS_SUBDIR
 

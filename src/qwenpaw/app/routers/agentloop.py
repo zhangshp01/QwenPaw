@@ -52,7 +52,9 @@ from ..workspace_paths import (
     paginate_govdocs_list,
     rename_govdocs_file,
     resolve_govdocs_file_path,
+    resolve_workspace_upload_directory,
     resolve_workspace_write_path,
+    save_upload_to_workspace_directory,
     sort_govdocs_by_modified_time,
     write_bytes_to_path,
 )
@@ -1192,9 +1194,45 @@ async def workspace_download(node_id: str) -> None:  # noqa: ARG001
 
 @workspace_router.post("/uploads", response_model=AgentLoopResponse)
 async def workspace_upload(
-    file: UploadFile | None = File(None),  # noqa: ARG001
+    request: Request,
+    directory: str = Form(
+        ...,
+        description=(
+            "Target directory under agent workspace "
+            "(e.g. govdocs or an absolute path under the workspace)"
+        ),
+    ),
+    file: UploadFile = File(..., description="File to upload"),
 ) -> AgentLoopResponse:
-    return _not_implemented("Workspace upload")
+    """Upload a file into *directory* under the active agent workspace."""
+    workspace = await get_agent_for_request(request)
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="file must have a filename")
+
+    data = await file.read()
+    if len(data) > MAX_WORKSPACE_BINARY_WRITE_BYTES:
+        limit_mb = MAX_WORKSPACE_BINARY_WRITE_BYTES // (1024 * 1024)
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large (max {limit_mb} MB)",
+        )
+
+    upload_filename = file.filename
+
+    def _do_upload() -> dict[str, Any]:
+        target_dir = resolve_workspace_upload_directory(
+            directory,
+            workspace.workspace_dir,
+        )
+        entry = save_upload_to_workspace_directory(
+            target_dir,
+            upload_filename,
+            data,
+        )
+        return annotate_govdocs_user([entry], workspace.agent_id)[0]
+
+    result = await asyncio.to_thread(_do_upload)
+    return AgentLoopResponse(data=result)
 
 
 @workspace_router.get("/documents/{node_id}", response_model=AgentLoopResponse)
