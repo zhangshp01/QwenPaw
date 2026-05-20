@@ -16,6 +16,9 @@ GOVDOCS_SUBDIR = "govdocs"
 DEFAULT_GOVDOCS_PAGE = 1
 DEFAULT_GOVDOCS_PAGE_SIZE = 20
 MAX_GOVDOCS_PAGE_SIZE = 100
+GOVDOCS_SORT_ASC = "asc"
+GOVDOCS_SORT_DESC = "desc"
+DEFAULT_GOVDOCS_SORT_ORDER = GOVDOCS_SORT_DESC
 
 # Max file size for embedding content in ``file_detail`` (10 MiB).
 MAX_GOVDOCS_DETAIL_CONTENT_BYTES = 10 * 1024 * 1024
@@ -100,7 +103,7 @@ def _govdocs_dir(workspace_dir: Path) -> Path:
 
 
 def list_govdocs_files(workspace_dir: Path) -> list[dict[str, Any]]:
-    """List regular files in ``govdocs/`` sorted by mtime descending."""
+    """List regular files in ``govdocs/`` (unsorted; use sort/filter helpers)."""
     root = _govdocs_dir(workspace_dir)
     if not root.is_dir():
         return []
@@ -110,8 +113,45 @@ def list_govdocs_files(workspace_dir: Path) -> list[dict[str, Any]]:
         if not path.is_file():
             continue
         entries.append(_file_entry(path))
-    entries.sort(key=lambda item: item["modified_time"], reverse=True)
     return entries
+
+
+def filter_govdocs_by_filename(
+    items: list[dict[str, Any]],
+    filename_query: str | None,
+) -> list[dict[str, Any]]:
+    """Keep items whose ``filename`` contains *filename_query* (case-insensitive)."""
+    if not filename_query or not filename_query.strip():
+        return items
+    needle = filename_query.strip().casefold()
+    return [
+        item
+        for item in items
+        if needle in item.get("filename", "").casefold()
+    ]
+
+
+def sort_govdocs_by_modified_time(
+    items: list[dict[str, Any]],
+    sort_order: str = DEFAULT_GOVDOCS_SORT_ORDER,
+) -> list[dict[str, Any]]:
+    """Sort by ``modified_time`` ascending or descending."""
+    order = (sort_order or DEFAULT_GOVDOCS_SORT_ORDER).strip().lower()
+    if order not in (GOVDOCS_SORT_ASC, GOVDOCS_SORT_DESC):
+        raise HTTPException(
+            status_code=400,
+            detail=f"sortOrder must be '{GOVDOCS_SORT_ASC}' or '{GOVDOCS_SORT_DESC}'",
+        )
+    reverse = order == GOVDOCS_SORT_DESC
+    return sorted(items, key=lambda item: item["modified_time"], reverse=reverse)
+
+
+def annotate_govdocs_user(
+    items: list[dict[str, Any]],
+    user: str,
+) -> list[dict[str, Any]]:
+    """Add ``user`` to each list entry."""
+    return [{**item, "user": user} for item in items]
 
 
 def paginate_govdocs_list(

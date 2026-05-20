@@ -6,14 +6,17 @@ import pytest
 from fastapi import HTTPException
 
 from qwenpaw.app.workspace_paths import (
+    annotate_govdocs_user,
     delete_govdocs_file,
     delete_govdocs_files_batch,
+    filter_govdocs_by_filename,
     govdocs_file_detail,
     list_govdocs_files,
     paginate_govdocs_list,
     rename_govdocs_file,
     resolve_govdocs_file_path,
     resolve_unique_govdocs_dest,
+    sort_govdocs_by_modified_time,
 )
 
 
@@ -23,7 +26,7 @@ def test_list_govdocs_files_empty_when_missing_dir(tmp_path: Path):
     assert list_govdocs_files(ws) == []
 
 
-def test_list_govdocs_files_sorted_by_mtime(tmp_path: Path):
+def test_sort_govdocs_by_modified_time(tmp_path: Path):
     ws = tmp_path / "agent"
     gov = ws / "govdocs"
     gov.mkdir(parents=True)
@@ -38,8 +41,37 @@ def test_list_govdocs_files_sorted_by_mtime(tmp_path: Path):
     os.utime(older, (now - 100, now - 100))
     os.utime(newer, (now, now))
 
-    names = [f["filename"] for f in list_govdocs_files(ws)]
-    assert names == ["b.docx", "a.docx"]
+    files = list_govdocs_files(ws)
+    desc = [f["filename"] for f in sort_govdocs_by_modified_time(files, "desc")]
+    asc = [f["filename"] for f in sort_govdocs_by_modified_time(files, "asc")]
+    assert desc == ["b.docx", "a.docx"]
+    assert asc == ["a.docx", "b.docx"]
+
+
+def test_filter_govdocs_by_filename():
+    items = [
+        {"filename": "关于大数据局职责的通知.docx"},
+        {"filename": "公文排版稿.docx"},
+        {"filename": "OTHER.DOCX"},
+    ]
+    assert len(filter_govdocs_by_filename(items, None)) == 3
+    assert len(filter_govdocs_by_filename(items, "")) == 3
+    matched = filter_govdocs_by_filename(items, "大数据")
+    assert [i["filename"] for i in matched] == ["关于大数据局职责的通知.docx"]
+    assert len(filter_govdocs_by_filename(items, "docx")) == 3
+
+
+def test_annotate_govdocs_user():
+    items = [{"filename": "a.docx"}]
+    out = annotate_govdocs_user(items, "o7VWjb")
+    assert out[0]["user"] == "o7VWjb"
+    assert out[0]["filename"] == "a.docx"
+
+
+def test_sort_govdocs_invalid_order():
+    with pytest.raises(HTTPException) as exc_info:
+        sort_govdocs_by_modified_time([], "invalid")
+    assert exc_info.value.status_code == 400
 
 
 def test_paginate_govdocs_list():
