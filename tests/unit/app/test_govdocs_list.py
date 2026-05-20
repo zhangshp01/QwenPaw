@@ -15,8 +15,8 @@ from qwenpaw.app.workspace_paths import (
     delete_govdocs_files_batch,
     filter_govdocs_by_filename,
     govdocs_file_detail,
+    build_govdocs_list_response,
     list_govdocs_files,
-    paginate_govdocs_list,
     rename_govdocs_file,
     resolve_govdocs_file_path,
     resolve_unique_govdocs_dest,
@@ -31,6 +31,35 @@ def test_list_govdocs_files_empty_when_missing_dir(tmp_path: Path):
     ws = tmp_path / "agent"
     ws.mkdir()
     assert list_govdocs_files(ws) == []
+
+
+def test_list_govdocs_files_includes_subdirectories_and_folders(tmp_path: Path):
+    ws = tmp_path / "agent"
+    gov = ws / "govdocs"
+    sub = gov / "reports" / "2026"
+    sub.mkdir(parents=True)
+    root_file = gov / "root.docx"
+    nested_file = sub / "nested.docx"
+    root_file.write_bytes(b"root")
+    nested_file.write_bytes(b"nested")
+
+    entries = list_govdocs_files(ws)
+    by_key = {(e["type"], e["filename"]): e for e in entries}
+
+    assert ("file", "root.docx") in by_key
+    assert ("file", "nested.docx") in by_key
+    assert ("directory", "reports") in by_key
+    assert ("directory", "2026") in by_key
+    assert by_key[("file", "nested.docx")]["relative_path"] == "reports/2026/nested.docx"
+
+
+def test_filter_govdocs_by_relative_path():
+    items = [
+        {"filename": "nested.docx", "relative_path": "reports/2026/nested.docx"},
+        {"filename": "2026", "type": "directory", "relative_path": "reports/2026"},
+    ]
+    matched = filter_govdocs_by_filename(items, "2026")
+    assert len(matched) == 2
 
 
 def test_sort_govdocs_by_modified_time(tmp_path: Path):
@@ -81,30 +110,12 @@ def test_sort_govdocs_invalid_order():
     assert exc_info.value.status_code == 400
 
 
-def test_paginate_govdocs_list():
-    items = [{"filename": f"f{i}.docx"} for i in range(5)]
-    page1 = paginate_govdocs_list(items, page=1, page_size=2)
-    assert page1["total"] == 5
-    assert page1["totalPages"] == 3
-    assert page1["page"] == 1
-    assert page1["pageSize"] == 2
-    assert len(page1["list"]) == 2
-    assert page1["list"][0]["filename"] == "f0.docx"
-
-    page3 = paginate_govdocs_list(items, page=3, page_size=2)
-    assert len(page3["list"]) == 1
-
-
-def test_paginate_invalid_page():
-    with pytest.raises(HTTPException) as exc_info:
-        paginate_govdocs_list([], page=0, page_size=10)
-    assert exc_info.value.status_code == 400
-
-
-def test_paginate_invalid_page_size():
-    with pytest.raises(HTTPException) as exc_info:
-        paginate_govdocs_list([], page=1, page_size=0)
-    assert exc_info.value.status_code == 400
+def test_build_govdocs_list_response_returns_full_list():
+    items = [{"filename": "a.docx"}, {"filename": "b.docx"}]
+    data = build_govdocs_list_response(items)
+    assert data == {"list": items}
+    assert "page" not in data
+    assert "total" not in data
 
 
 def test_resolve_govdocs_file_path_rejects_outside_govdocs(tmp_path: Path):

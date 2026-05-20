@@ -37,19 +37,16 @@ from agentscope_runtime.engine.schemas.agent_schemas import Message
 
 from ..agent_context import get_agent_for_request
 from ..workspace_paths import (
-    DEFAULT_GOVDOCS_PAGE,
-    DEFAULT_GOVDOCS_PAGE_SIZE,
     DEFAULT_GOVDOCS_SORT_ORDER,
     GOVDOCS_SORT_ASC,
     GOVDOCS_SORT_DESC,
-    MAX_GOVDOCS_PAGE_SIZE,
     MAX_WORKSPACE_BINARY_WRITE_BYTES,
     annotate_govdocs_user,
+    build_govdocs_list_response,
     delete_govdocs_files_batch,
     filter_govdocs_by_filename,
     govdocs_file_detail,
     list_govdocs_files,
-    paginate_govdocs_list,
     rename_govdocs_file,
     build_workspace_files_zip,
     mime_type_for_suffix,
@@ -1105,29 +1102,25 @@ async def workspace_write_files_binary(
 @workspace_router.get("/get_list", response_model=AgentLoopResponse)
 async def workspace_govdocs_get_list(
     request: Request,
-    page: int = Query(DEFAULT_GOVDOCS_PAGE, ge=1, description="Page number (1-based)"),
-    pageSize: int = Query(  # noqa: N803  # API uses camelCase
-        DEFAULT_GOVDOCS_PAGE_SIZE,
-        ge=1,
-        le=MAX_GOVDOCS_PAGE_SIZE,
-        description="Items per page",
-    ),
     sortOrder: str = Query(  # noqa: N803  # API uses camelCase
         DEFAULT_GOVDOCS_SORT_ORDER,
         description=f"Sort by modified_time: {GOVDOCS_SORT_ASC} or {GOVDOCS_SORT_DESC}",
     ),
     filename: str | None = Query(
         None,
-        description="Fuzzy filter on filename (case-insensitive substring)",
+        description=(
+            "Fuzzy filter on filename or relative path under govdocs "
+            "(case-insensitive substring)"
+        ),
     ),
 ) -> AgentLoopResponse:
-    """List files under ``govdocs/`` in the agent workspace with pagination."""
+    """List files and folders under ``govdocs/`` (recursive), full list."""
     workspace = await get_agent_for_request(request)
     all_files = await asyncio.to_thread(list_govdocs_files, workspace.workspace_dir)
     all_files = filter_govdocs_by_filename(all_files, filename)
     all_files = sort_govdocs_by_modified_time(all_files, sortOrder)
     all_files = annotate_govdocs_user(all_files, workspace.agent_id)
-    data = paginate_govdocs_list(all_files, page, pageSize)
+    data = build_govdocs_list_response(all_files)
     return AgentLoopResponse(data=data)
 
 

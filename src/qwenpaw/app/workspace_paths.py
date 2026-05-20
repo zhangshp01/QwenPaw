@@ -15,9 +15,6 @@ from fastapi import HTTPException
 from ..constant import SECRET_DIR
 
 GOVDOCS_SUBDIR = "govdocs"
-DEFAULT_GOVDOCS_PAGE = 1
-DEFAULT_GOVDOCS_PAGE_SIZE = 20
-MAX_GOVDOCS_PAGE_SIZE = 100
 GOVDOCS_SORT_ASC = "asc"
 GOVDOCS_SORT_DESC = "desc"
 DEFAULT_GOVDOCS_SORT_ORDER = GOVDOCS_SORT_DESC
@@ -224,16 +221,17 @@ def _govdocs_dir(workspace_dir: Path) -> Path:
 
 
 def list_govdocs_files(workspace_dir: Path) -> list[dict[str, Any]]:
-    """List regular files in ``govdocs/`` (unsorted; use sort/filter helpers)."""
+    """List files and directories under ``govdocs/``, including subdirectories."""
     root = _govdocs_dir(workspace_dir)
     if not root.is_dir():
         return []
 
     entries: list[dict[str, Any]] = []
-    for path in root.iterdir():
-        if not path.is_file():
-            continue
-        entries.append(_file_entry(path))
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            entries.append(_dir_entry(path, root))
+        elif path.is_file():
+            entries.append(_file_entry(path, govdocs_root=root))
     return entries
 
 
@@ -241,15 +239,18 @@ def filter_govdocs_by_filename(
     items: list[dict[str, Any]],
     filename_query: str | None,
 ) -> list[dict[str, Any]]:
-    """Keep items whose ``filename`` contains *filename_query* (case-insensitive)."""
+    """Keep items matching *filename_query* against name or ``relative_path``."""
     if not filename_query or not filename_query.strip():
         return items
     needle = filename_query.strip().casefold()
-    return [
-        item
-        for item in items
-        if needle in item.get("filename", "").casefold()
-    ]
+    return [item for item in items if _govdocs_entry_matches_query(item, needle)]
+
+
+def _govdocs_entry_matches_query(item: dict[str, Any], needle: str) -> bool:
+    if needle in item.get("filename", "").casefold():
+        return True
+    relative = item.get("relative_path", "")
+    return bool(relative) and needle in relative.casefold()
 
 
 def sort_govdocs_by_modified_time(
@@ -275,33 +276,9 @@ def annotate_govdocs_user(
     return [{**item, "user": user} for item in items]
 
 
-def paginate_govdocs_list(
-    items: list[dict[str, Any]],
-    page: int,
-    page_size: int,
-) -> dict[str, Any]:
-    """Return a page slice plus pagination metadata."""
-    if page < 1:
-        raise HTTPException(status_code=400, detail="page must be >= 1")
-    if page_size < 1 or page_size > MAX_GOVDOCS_PAGE_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail=f"pageSize must be between 1 and {MAX_GOVDOCS_PAGE_SIZE}",
-        )
-
-    total = len(items)
-    total_pages = (total + page_size - 1) // page_size if total else 0
-    start = (page - 1) * page_size
-    end = start + page_size
-    page_list = items[start:end]
-
-    return {
-        "list": page_list,
-        "page": page,
-        "pageSize": page_size,
-        "total": total,
-        "totalPages": total_pages,
-    }
+def build_govdocs_list_response(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Wrap govdocs entries for ``get_list`` (full list, no pagination)."""
+    return {"list": items}
 
 
 def resolve_govdocs_file_path(path_str: str, workspace_dir: Path) -> Path:
@@ -318,9 +295,30 @@ def resolve_govdocs_file_path(path_str: str, workspace_dir: Path) -> Path:
     return target
 
 
-def _file_entry(path: Path) -> dict[str, Any]:
+def _dir_entry(path: Path, govdocs_root: Path) -> dict[str, Any]:
     stat = path.stat()
     return {
+        "type": "directory",
+        "filename": path.name,
+        "relative_path": path.relative_to(govdocs_root).as_posix(),
+        "path": str(path.resolve()),
+        "size": 0,
+        "suffix": "",
+        "created_time": datetime.fromtimestamp(
+            stat.st_ctime,
+            tz=timezone.utc,
+        ).isoformat(),
+        "modified_time": datetime.fromtimestamp(
+            stat.st_mtime,
+            tz=timezone.utc,
+        ).isoformat(),
+    }
+
+
+def _file_entry(path: Path, *, govdocs_root: Path | None = None) -> dict[str, Any]:
+    stat = path.stat()
+    entry: dict[str, Any] = {
+        "type": "file",
         "filename": path.name,
         "path": str(path.resolve()),
         "size": stat.st_size,
@@ -334,6 +332,9 @@ def _file_entry(path: Path) -> dict[str, Any]:
             tz=timezone.utc,
         ).isoformat(),
     }
+    if govdocs_root is not None:
+        entry["relative_path"] = path.relative_to(govdocs_root).as_posix()
+    return entry
 
 
 def _mime_for_suffix(suffix: str) -> str:
