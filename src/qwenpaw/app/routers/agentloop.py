@@ -37,7 +37,16 @@ from agentscope_runtime.engine.schemas.agent_schemas import Message
 
 from ..agent_context import get_agent_for_request
 from ..workspace_paths import (
+    DEFAULT_GOVDOCS_PAGE,
+    DEFAULT_GOVDOCS_PAGE_SIZE,
+    MAX_GOVDOCS_PAGE_SIZE,
     MAX_WORKSPACE_BINARY_WRITE_BYTES,
+    delete_govdocs_files_batch,
+    govdocs_file_detail,
+    list_govdocs_files,
+    paginate_govdocs_list,
+    rename_govdocs_file,
+    resolve_govdocs_file_path,
     resolve_workspace_write_path,
     write_bytes_to_path,
 )
@@ -131,6 +140,27 @@ class WorkspaceNodeRenameRequest(BaseModel):
 
 class WorkspaceNodeMoveRequest(BaseModel):
     parent_id: str | None = None
+
+
+class WorkspaceGovdocRenameRequest(BaseModel):
+    """Rename a file in ``govdocs/`` (basename only)."""
+
+    path: str = Field(..., description="Existing file path (relative or absolute)")
+    newFilename: str = Field(  # noqa: N815
+        ...,
+        min_length=1,
+        description="New file name including extension, e.g. new-title.docx",
+    )
+
+
+class WorkspaceGovdocBatchDeleteRequest(BaseModel):
+    """Batch-delete files under ``govdocs/``."""
+
+    paths: list[str] = Field(
+        ...,
+        min_length=1,
+        description="File paths (relative under govdocs/ or absolute under workspace)",
+    )
 
 
 # Root mount: included from ``routers`` under ``/api`` → ``/api/agentloop/...``
@@ -1049,9 +1079,66 @@ async def workspace_write_files_binary(
     )
 
 
-@workspace_router.get("", response_model=AgentLoopResponse)
-async def workspace_list(view: str = "recent") -> AgentLoopResponse:  # noqa: ARG001
-    return _not_implemented("Workspace list")
+@workspace_router.get("/get_list", response_model=AgentLoopResponse)
+async def workspace_govdocs_get_list(
+    request: Request,
+    page: int = Query(DEFAULT_GOVDOCS_PAGE, ge=1, description="Page number (1-based)"),
+    pageSize: int = Query(  # noqa: N803  # API uses camelCase
+        DEFAULT_GOVDOCS_PAGE_SIZE,
+        ge=1,
+        le=MAX_GOVDOCS_PAGE_SIZE,
+        description="Items per page",
+    ),
+) -> AgentLoopResponse:
+    """List files under ``govdocs/`` in the agent workspace with pagination."""
+    workspace = await get_agent_for_request(request)
+    all_files = await asyncio.to_thread(list_govdocs_files, workspace.workspace_dir)
+    data = paginate_govdocs_list(all_files, page, pageSize)
+    return AgentLoopResponse(data=data)
+
+
+@workspace_router.get("/file_detail", response_model=AgentLoopResponse)
+async def workspace_govdocs_file_detail(
+    request: Request,
+    path: str = Query(..., min_length=1, description="File path under govdocs/"),
+) -> AgentLoopResponse:
+    """Return metadata for one file under ``govdocs/``."""
+    workspace = await get_agent_for_request(request)
+    target = resolve_govdocs_file_path(path, workspace.workspace_dir)
+    detail = await asyncio.to_thread(govdocs_file_detail, target)
+    return AgentLoopResponse(data=detail)
+
+
+@workspace_router.put("/file_rename", response_model=AgentLoopResponse)
+async def workspace_govdocs_file_rename(
+    request: Request,
+    body: WorkspaceGovdocRenameRequest,
+) -> AgentLoopResponse:
+    """Rename a file in ``govdocs/`` (``newFilename`` is basename only)."""
+    workspace = await get_agent_for_request(request)
+    target = resolve_govdocs_file_path(body.path, workspace.workspace_dir)
+
+    def _do_rename() -> dict[str, Any]:
+        new_path = rename_govdocs_file(target, body.newFilename)
+        return govdocs_file_detail(new_path)
+
+    data = await asyncio.to_thread(_do_rename)
+    return AgentLoopResponse(data=data)
+
+
+@workspace_router.delete("/file_delete", response_model=AgentLoopResponse)
+async def workspace_govdocs_file_delete(
+    request: Request,
+    body: WorkspaceGovdocBatchDeleteRequest,
+) -> AgentLoopResponse:
+    """Batch-delete files under ``govdocs/`` (partial success allowed)."""
+    workspace = await get_agent_for_request(request)
+    data = await asyncio.to_thread(
+        delete_govdocs_files_batch,
+        workspace.workspace_dir,
+        body.paths,
+    )
+    return AgentLoopResponse(data=data)
 
 
 @workspace_router.get("/tree", response_model=AgentLoopResponse)
