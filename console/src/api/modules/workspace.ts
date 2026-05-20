@@ -39,6 +39,12 @@ export interface WorkspaceDownloadResult {
   filename: string;
 }
 
+export interface WorkspaceBinaryWriteResult {
+  written: boolean;
+  path: string;
+  size: number;
+}
+
 export const workspaceApi = {
   listFiles: () =>
     request<MdFileInfo[]>("/workspace/files").then((files) =>
@@ -59,6 +65,55 @@ export const workspaceApi = {
         body: JSON.stringify({ content }),
       },
     ),
+
+  /**
+   * Write a `.docx` blob to a path under the active agent workspace.
+   *
+   * @example
+   * await workspaceApi.writeFileBinary(
+   *   "C:\\\\Users\\\\you\\\\.qwenpaw\\\\workspaces\\\\o7VWjb\\\\govdocs\\\\地震-20260519103658680171.docx",
+   *   docxBlob,
+   * );
+   * // or relative: "govdocs/地震-20260519103658680171.docx"
+   */
+  writeFileBinary: async (
+    path: string,
+    body: Blob | ArrayBuffer | Uint8Array,
+  ): Promise<WorkspaceBinaryWriteResult> => {
+    const url = `${getApiUrl("/agentloop/workspace/files_binary")}?path=${encodeURIComponent(path)}`;
+    const payload =
+      body instanceof Blob
+        ? body
+        : new Blob([body instanceof Uint8Array ? body : new Uint8Array(body)]);
+
+    const response = await fetch(url, {
+      method: "PUT",
+      headers: {
+        ...buildAuthHeaders(),
+        "Content-Type": "application/octet-stream",
+      },
+      body: payload,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "");
+      throw new Error(
+        `Binary write failed: ${response.status} ${response.statusText}${
+          errorText ? ` - ${errorText}` : ""
+        }`,
+      );
+    }
+
+    const envelope = (await response.json()) as {
+      code: number;
+      message: string;
+      data: WorkspaceBinaryWriteResult;
+    };
+    if (envelope.code !== 0) {
+      throw new Error(envelope.message || "Binary write failed");
+    }
+    return envelope.data;
+  },
 
   // Workspace package download
   downloadWorkspace: async (): Promise<WorkspaceDownloadResult> => {

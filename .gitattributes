@@ -1,1 +1,4 @@
+* text=auto
 *.bat text eol=crlf
+*.sh text eol=lf
+deploy/entrypoint.sh text eol=lf

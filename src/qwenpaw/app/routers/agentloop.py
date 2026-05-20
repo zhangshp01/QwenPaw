@@ -12,6 +12,7 @@ Reference implementation:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import uuid
@@ -35,6 +36,11 @@ from pydantic import BaseModel, Field
 from agentscope_runtime.engine.schemas.agent_schemas import Message
 
 from ..agent_context import get_agent_for_request
+from ..workspace_paths import (
+    MAX_WORKSPACE_BINARY_WRITE_BYTES,
+    resolve_workspace_write_path,
+    write_bytes_to_path,
+)
 from .console import _extract_session_and_payload
 from .skills import _build_workspace_skill_specs
 from ..runner.manager import ChatManager
@@ -999,8 +1005,48 @@ async def stream_conversation_events(
 router.include_router(conversations_router)
 
 # ---------------------------------------------------------------------------
-# /api/agentloop/workspace (stubs — no govdoc SQLite workspace in QwenPaw)
+# /api/agentloop/workspace
 # ---------------------------------------------------------------------------
+
+
+@workspace_router.put("/files_binary", response_model=AgentLoopResponse)
+async def workspace_write_files_binary(
+    request: Request,
+    path: str = Query(
+        ...,
+        min_length=1,
+        description=(
+            "Target .docx path (relative to workspace or absolute under workspace)"
+        ),
+    ),
+) -> AgentLoopResponse:
+    """Write request body bytes to *path* in the active agent workspace (``.docx``)."""
+    workspace = await get_agent_for_request(request)
+    target = resolve_workspace_write_path(path, workspace.workspace_dir)
+
+    data = await request.body()
+    if len(data) > MAX_WORKSPACE_BINARY_WRITE_BYTES:
+        limit_mb = MAX_WORKSPACE_BINARY_WRITE_BYTES // (1024 * 1024)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Payload too large (max {limit_mb} MB)",
+        )
+
+    try:
+        await asyncio.to_thread(write_bytes_to_path, target, data)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to write file: {exc}",
+        ) from exc
+
+    return AgentLoopResponse(
+        data={
+            "written": True,
+            "path": str(target),
+            "size": len(data),
+        },
+    )
 
 
 @workspace_router.get("", response_model=AgentLoopResponse)
