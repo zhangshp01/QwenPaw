@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import re
+import shutil
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -115,6 +117,135 @@ def resolve_workspace_upload_directory(
     return target
 
 
+def _validate_folder_name(folder_name: str) -> str:
+    name = (folder_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="folder_name must not be empty")
+    if name in (".", ".."):
+        raise HTTPException(status_code=400, detail="folder_name is not allowed")
+    if "/" in name or "\\" in name or Path(name).name != name:
+        raise HTTPException(
+            status_code=400,
+            detail="folder_name must be a single folder name without path separators",
+        )
+    return name
+
+
+def create_workspace_folder(
+    parent_dir_str: str,
+    folder_name: str,
+    workspace_dir: Path,
+) -> dict[str, Any]:
+    """Create a folder named *folder_name* under *parent_dir_str*."""
+    name = _validate_folder_name(folder_name)
+    parent = resolve_workspace_upload_directory(parent_dir_str, workspace_dir)
+    if not parent.exists():
+        raise HTTPException(status_code=404, detail="parent_dir not found")
+    if not parent.is_dir():
+        raise HTTPException(status_code=400, detail="parent_dir must be a directory")
+
+    target = resolve_unique_govdocs_dest(parent, name)
+
+    try:
+        target.mkdir(parents=False, exist_ok=False)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to create folder: {exc}",
+        ) from exc
+
+    govdocs_root = _govdocs_dir(workspace_dir)
+    workspace_root = workspace_dir.expanduser().resolve()
+    return _dir_entry(target, govdocs_root, workspace_root)
+
+
+def _validate_file_name(file_name: str) -> str:
+    raw = (file_name or "").strip()
+    name = Path(raw).name
+    if not name or name in {".", ".."}:
+        raise HTTPException(status_code=400, detail="file_name must not be empty")
+    if raw != name:
+        raise HTTPException(
+            status_code=400,
+            detail="file_name must be a single file name without path separators",
+        )
+    return name
+
+
+def _document_body_text(
+    content_text: str | None,
+    content_html: str | None,
+) -> str:
+    text = (content_text or "").strip()
+    if text:
+        return content_text or ""
+    html = (content_html or "").strip()
+    if not html:
+        return ""
+    plain = re.sub(r"<[^>]+>", "", html)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    return plain
+
+
+def _write_workspace_docx(path: Path, content_text: str | None, content_html: str | None) -> None:
+    try:
+        from docx import Document  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="python-docx is required to create .docx files",
+        ) from exc
+
+    doc = Document()
+    body = _document_body_text(content_text, content_html)
+    if body:
+        for line in body.splitlines():
+            doc.add_paragraph(line.rstrip("\r"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(path))
+
+
+def create_workspace_document(
+    parent_dir_str: str,
+    file_name: str,
+    workspace_dir: Path,
+    *,
+    content_text: str | None = None,
+    content_html: str | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """Create a file named *file_name* under *parent_dir_str*."""
+    name = _validate_file_name(file_name)
+    parent = resolve_workspace_upload_directory(parent_dir_str, workspace_dir)
+    if not parent.exists():
+        raise HTTPException(status_code=404, detail="parent_dir not found")
+    if not parent.is_dir():
+        raise HTTPException(status_code=400, detail="parent_dir must be a directory")
+
+    target = resolve_unique_govdocs_dest(parent, name)
+
+    suffix = target.suffix.lower()
+    try:
+        if suffix == ".docx":
+            _write_workspace_docx(target, content_text, content_html)
+        else:
+            parent.mkdir(parents=True, exist_ok=True)
+            payload = (content_text or "").encode("utf-8")
+            write_bytes_to_path(target, payload)
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to create file: {exc}",
+        ) from exc
+
+    detail = govdocs_file_detail(target)
+    if source:
+        detail["source"] = source
+    return detail
+
+
 def save_upload_to_workspace_directory(
     directory: Path,
     upload_filename: str,
@@ -220,18 +351,54 @@ def _govdocs_dir(workspace_dir: Path) -> Path:
     return workspace_dir.expanduser().resolve() / GOVDOCS_SUBDIR
 
 
-def list_govdocs_files(workspace_dir: Path) -> list[dict[str, Any]]:
-    """List files and directories under ``govdocs/``, including subdirectories."""
-    root = _govdocs_dir(workspace_dir)
+def resolve_workspace_list_directory(
+    path_str: str | None,
+    workspace_dir: Path,
+) -> Path:
+    """Resolve the directory root for workspace ``get_list``.
+
+    When *path_str* is omitted, defaults to ``govdocs/`` (may not exist yet).
+    When provided, *path_str* must refer to an existing directory under the
+    workspace.
+    """
+    govdocs_root = _govdocs_dir(workspace_dir)
+    if not path_str or not path_str.strip():
+        return govdocs_root
+
+    target = resolve_workspace_write_path(path_str, workspace_dir)
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+    if not target.is_dir():
+        raise HTTPException(status_code=400, detail="Path must be a directory")
+    return target
+
+
+def list_govdocs_files(
+    workspace_dir: Path,
+    *,
+    list_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    """List files and directories under *list_root* recursively.
+
+    Defaults to ``govdocs/``. Returns an empty list when the root directory
+    does not exist (only for the default ``govdocs/`` case).
+    """
+    govdocs_root = _govdocs_dir(workspace_dir)
+    workspace_root = workspace_dir.expanduser().resolve()
+    root = list_root if list_root is not None else govdocs_root
     if not root.is_dir():
         return []
 
     entries: list[dict[str, Any]] = []
     for path in sorted(root.rglob("*")):
         if path.is_dir():
-            entries.append(_dir_entry(path, root))
+            entries.append(
+                _dir_entry(path, govdocs_root, workspace_root),
+            )
         elif path.is_file():
-            entries.append(_file_entry(path, govdocs_root=root))
+            entries.append(
+                _file_entry(path, govdocs_root=govdocs_root, workspace_root=workspace_root),
+            )
     return entries
 
 
@@ -295,12 +462,33 @@ def resolve_govdocs_file_path(path_str: str, workspace_dir: Path) -> Path:
     return target
 
 
-def _dir_entry(path: Path, govdocs_root: Path) -> dict[str, Any]:
+def _entry_relative_path(
+    path: Path,
+    *,
+    govdocs_root: Path,
+    workspace_root: Path,
+) -> str:
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(govdocs_root.resolve()).as_posix()
+    except ValueError:
+        return resolved.relative_to(workspace_root).as_posix()
+
+
+def _dir_entry(
+    path: Path,
+    govdocs_root: Path,
+    workspace_root: Path,
+) -> dict[str, Any]:
     stat = path.stat()
     return {
         "type": "directory",
         "filename": path.name,
-        "relative_path": path.relative_to(govdocs_root).as_posix(),
+        "relative_path": _entry_relative_path(
+            path,
+            govdocs_root=govdocs_root,
+            workspace_root=workspace_root,
+        ),
         "path": str(path.resolve()),
         "size": 0,
         "suffix": "",
@@ -315,7 +503,12 @@ def _dir_entry(path: Path, govdocs_root: Path) -> dict[str, Any]:
     }
 
 
-def _file_entry(path: Path, *, govdocs_root: Path | None = None) -> dict[str, Any]:
+def _file_entry(
+    path: Path,
+    *,
+    govdocs_root: Path | None = None,
+    workspace_root: Path | None = None,
+) -> dict[str, Any]:
     stat = path.stat()
     entry: dict[str, Any] = {
         "type": "file",
@@ -332,8 +525,12 @@ def _file_entry(path: Path, *, govdocs_root: Path | None = None) -> dict[str, An
             tz=timezone.utc,
         ).isoformat(),
     }
-    if govdocs_root is not None:
-        entry["relative_path"] = path.relative_to(govdocs_root).as_posix()
+    if govdocs_root is not None and workspace_root is not None:
+        entry["relative_path"] = _entry_relative_path(
+            path,
+            govdocs_root=govdocs_root,
+            workspace_root=workspace_root,
+        )
     return entry
 
 
@@ -438,25 +635,57 @@ def resolve_unique_govdocs_dest(
     )
 
 
-def rename_govdocs_file(path: Path, new_filename: str) -> Path:
-    """Rename *path* to *new_filename* (basename only) within ``govdocs/``."""
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
+def _assert_not_govdocs_root(path: Path, workspace_dir: Path) -> None:
+    if path.resolve() == _govdocs_dir(workspace_dir).resolve():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot modify the govdocs root directory",
+        )
 
+
+def govdocs_path_detail(path: Path, workspace_dir: Path) -> dict[str, Any]:
+    """Return metadata for a file or directory under ``govdocs/``."""
+    if path.is_file():
+        return govdocs_file_detail(path)
+    if path.is_dir():
+        govdocs_root = _govdocs_dir(workspace_dir)
+        workspace_root = workspace_dir.expanduser().resolve()
+        return _dir_entry(path, govdocs_root, workspace_root)
+    raise HTTPException(status_code=404, detail="Path not found")
+
+
+def rename_govdocs_file(
+    path: Path,
+    new_filename: str,
+    workspace_dir: Path,
+) -> Path:
+    """Rename a file or directory to *new_filename* (basename only) in ``govdocs/``."""
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+    _assert_not_govdocs_root(path, workspace_dir)
+
+    safe_name = _validate_file_name(new_filename)
     dest = resolve_unique_govdocs_dest(
         path.parent,
-        new_filename,
+        safe_name,
         exclude=path.resolve(),
     )
     path.rename(dest)
     return dest.resolve()
 
 
-def delete_govdocs_file(path: Path) -> None:
-    """Delete a regular file under ``govdocs/``."""
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-    path.unlink()
+def delete_govdocs_file(path: Path, workspace_dir: Path) -> None:
+    """Delete a file or directory under ``govdocs/`` (recursive for directories)."""
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+    _assert_not_govdocs_root(path, workspace_dir)
+
+    if path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+    else:
+        raise HTTPException(status_code=404, detail="Path not found")
 
 
 MAX_GOVDOCS_BATCH_DELETE = 100
@@ -466,7 +695,7 @@ def delete_govdocs_files_batch(
     workspace_dir: Path,
     path_strings: list[str],
 ) -> dict[str, Any]:
-    """Delete multiple ``govdocs`` files; continue on individual failures."""
+    """Delete multiple files or directories under ``govdocs/``; continue on failures."""
     if not path_strings:
         raise HTTPException(status_code=400, detail="paths must not be empty")
     if len(path_strings) > MAX_GOVDOCS_BATCH_DELETE:
@@ -485,7 +714,7 @@ def delete_govdocs_files_batch(
             continue
         try:
             target = resolve_govdocs_file_path(path_label, workspace_dir)
-            delete_govdocs_file(target)
+            delete_govdocs_file(target, workspace_dir)
             deleted.append({"path": str(target.resolve())})
         except HTTPException as exc:
             detail = exc.detail

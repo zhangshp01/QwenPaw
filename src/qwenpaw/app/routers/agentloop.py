@@ -43,10 +43,14 @@ from ..workspace_paths import (
     MAX_WORKSPACE_BINARY_WRITE_BYTES,
     annotate_govdocs_user,
     build_govdocs_list_response,
+    create_workspace_folder,
+    create_workspace_document,
     delete_govdocs_files_batch,
     filter_govdocs_by_filename,
     govdocs_file_detail,
+    govdocs_path_detail,
     list_govdocs_files,
+    resolve_workspace_list_directory,
     rename_govdocs_file,
     build_workspace_files_zip,
     mime_type_for_suffix,
@@ -123,13 +127,21 @@ class DictionaryEntryCreateRequest(BaseModel):
 
 
 class WorkspaceFolderCreateRequest(BaseModel):
-    name: str
-    parent_id: str | None = None
+    folder_name: str = Field(..., min_length=1, description="Name of the new folder")
+    parent_dir: str = Field(
+        ...,
+        min_length=1,
+        description="Parent directory path (relative or absolute under workspace)",
+    )
 
 
 class WorkspaceDocumentCreateRequest(BaseModel):
-    name: str
-    parent_id: str | None = None
+    file_name: str = Field(..., min_length=1, description="Name of the new file")
+    parent_dir: str = Field(
+        ...,
+        min_length=1,
+        description="Parent directory path (relative or absolute under workspace)",
+    )
     content_html: str | None = None
     content_text: str | None = None
     source: str | None = "manual"
@@ -151,23 +163,29 @@ class WorkspaceNodeMoveRequest(BaseModel):
 
 
 class WorkspaceGovdocRenameRequest(BaseModel):
-    """Rename a file in ``govdocs/`` (basename only)."""
+    """Rename a file or directory in ``govdocs/`` (basename only)."""
 
-    path: str = Field(..., description="Existing file path (relative or absolute)")
+    path: str = Field(
+        ...,
+        description="Existing file or directory path (relative or absolute)",
+    )
     newFilename: str = Field(  # noqa: N815
         ...,
         min_length=1,
-        description="New file name including extension, e.g. new-title.docx",
+        description="New name (basename only), e.g. new-title.docx or 新目录",
     )
 
 
 class WorkspaceGovdocBatchDeleteRequest(BaseModel):
-    """Batch-delete files under ``govdocs/``."""
+    """Batch-delete files or directories under ``govdocs/``."""
 
     paths: list[str] = Field(
         ...,
         min_length=1,
-        description="File paths (relative under govdocs/ or absolute under workspace)",
+        description=(
+            "File or directory paths (relative under govdocs/ or absolute "
+            "under workspace); directories are removed recursively"
+        ),
     )
 
 
@@ -1113,10 +1131,27 @@ async def workspace_govdocs_get_list(
             "(case-insensitive substring)"
         ),
     ),
+    path: str | None = Query(
+        None,
+        description=(
+            "Directory path under the agent workspace (relative or absolute). "
+            "Lists all files and folders under this path recursively. "
+            "Defaults to govdocs/ when omitted."
+        ),
+    ),
 ) -> AgentLoopResponse:
-    """List files and folders under ``govdocs/`` (recursive), full list."""
+    """List files and folders under a workspace directory (recursive), full list."""
     workspace = await get_agent_for_request(request)
-    all_files = await asyncio.to_thread(list_govdocs_files, workspace.workspace_dir)
+    list_root = await asyncio.to_thread(
+        resolve_workspace_list_directory,
+        path,
+        workspace.workspace_dir,
+    )
+    all_files = await asyncio.to_thread(
+        list_govdocs_files,
+        workspace.workspace_dir,
+        list_root=list_root,
+    )
     all_files = filter_govdocs_by_filename(all_files, filename)
     all_files = sort_govdocs_by_modified_time(all_files, sortOrder)
     all_files = annotate_govdocs_user(all_files, workspace.agent_id)
@@ -1141,13 +1176,17 @@ async def workspace_govdocs_file_rename(
     request: Request,
     body: WorkspaceGovdocRenameRequest,
 ) -> AgentLoopResponse:
-    """Rename a file in ``govdocs/`` (``newFilename`` is basename only)."""
+    """Rename a file or directory in ``govdocs/`` (``newFilename`` is basename only)."""
     workspace = await get_agent_for_request(request)
     target = resolve_govdocs_file_path(body.path, workspace.workspace_dir)
 
     def _do_rename() -> dict[str, Any]:
-        new_path = rename_govdocs_file(target, body.newFilename)
-        return govdocs_file_detail(new_path)
+        new_path = rename_govdocs_file(
+            target,
+            body.newFilename,
+            workspace.workspace_dir,
+        )
+        return govdocs_path_detail(new_path, workspace.workspace_dir)
 
     data = await asyncio.to_thread(_do_rename)
     return AgentLoopResponse(data=data)
@@ -1158,7 +1197,7 @@ async def workspace_govdocs_file_delete(
     request: Request,
     body: WorkspaceGovdocBatchDeleteRequest,
 ) -> AgentLoopResponse:
-    """Batch-delete files under ``govdocs/`` (partial success allowed)."""
+    """Batch-delete files or directories under ``govdocs/`` (partial success allowed)."""
     workspace = await get_agent_for_request(request)
     data = await asyncio.to_thread(
         delete_govdocs_files_batch,
@@ -1175,16 +1214,37 @@ async def workspace_tree() -> AgentLoopResponse:
 
 @workspace_router.post("/folders", response_model=AgentLoopResponse)
 async def workspace_create_folder(
-    payload: WorkspaceFolderCreateRequest,  # noqa: ARG001
+    request: Request,
+    payload: WorkspaceFolderCreateRequest,
 ) -> AgentLoopResponse:
-    return _not_implemented("Workspace folder create")
+    """Create a folder under *parent_dir* in the active agent workspace."""
+    workspace = await get_agent_for_request(request)
+    entry = await asyncio.to_thread(
+        create_workspace_folder,
+        payload.parent_dir,
+        payload.folder_name,
+        workspace.workspace_dir,
+    )
+    return AgentLoopResponse(data=entry)
 
 
 @workspace_router.post("/documents", response_model=AgentLoopResponse)
 async def workspace_create_document(
-    payload: WorkspaceDocumentCreateRequest,  # noqa: ARG001
+    request: Request,
+    payload: WorkspaceDocumentCreateRequest,
 ) -> AgentLoopResponse:
-    return _not_implemented("Workspace document create")
+    """Create a file under *parent_dir* in the active agent workspace."""
+    workspace = await get_agent_for_request(request)
+    detail = await asyncio.to_thread(
+        create_workspace_document,
+        payload.parent_dir,
+        payload.file_name,
+        workspace.workspace_dir,
+        content_text=payload.content_text,
+        content_html=payload.content_html,
+        source=payload.source,
+    )
+    return AgentLoopResponse(data=detail)
 
 
 @workspace_router.post(

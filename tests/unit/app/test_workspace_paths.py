@@ -6,6 +6,8 @@ import pytest
 from fastapi import HTTPException
 
 from qwenpaw.app.workspace_paths import (
+    create_workspace_document,
+    create_workspace_folder,
     normalize_path_argument,
     resolve_workspace_write_path,
 )
@@ -55,3 +57,87 @@ def test_resolve_rejects_parent_traversal(tmp_path: Path):
     with pytest.raises(HTTPException) as exc_info:
         resolve_workspace_write_path("../../etc/passwd", ws)
     assert exc_info.value.status_code == 403
+
+
+def test_create_workspace_folder_under_parent_dir(tmp_path: Path):
+    ws = tmp_path / "agent"
+    gov = ws / "govdocs"
+    gov.mkdir(parents=True)
+
+    entry = create_workspace_folder(str(gov), "目录2", ws)
+
+    assert entry["type"] == "directory"
+    assert entry["filename"] == "目录2"
+    assert (gov / "目录2").is_dir()
+    assert entry["relative_path"] == "目录2"
+
+
+def test_create_workspace_folder_rejects_nested_name(tmp_path: Path):
+    ws = tmp_path / "agent"
+    gov = ws / "govdocs"
+    gov.mkdir(parents=True)
+
+    with pytest.raises(HTTPException) as exc_info:
+        create_workspace_folder("govdocs", "a/b", ws)
+    assert exc_info.value.status_code == 400
+
+
+def test_create_workspace_folder_uses_copy_suffix_when_duplicate(tmp_path: Path):
+    ws = tmp_path / "agent"
+    gov = ws / "govdocs"
+    target = gov / "exists"
+    target.mkdir(parents=True)
+
+    entry = create_workspace_folder("govdocs", "exists", ws)
+
+    assert entry["filename"] == "exists - 副本"
+    assert (gov / "exists - 副本").is_dir()
+
+
+def test_create_workspace_document_docx_under_parent_dir(tmp_path: Path):
+    ws = tmp_path / "agent"
+    parent = ws / "govdocs" / "目录2"
+    parent.mkdir(parents=True)
+
+    detail = create_workspace_document(
+        str(parent),
+        "测试文档1.docx",
+        ws,
+        content_html="<p></p>",
+        content_text="",
+        source="manual",
+    )
+
+    target = parent / "测试文档1.docx"
+    assert target.is_file()
+    assert detail["filename"] == "测试文档1.docx"
+    assert detail["source"] == "manual"
+    assert detail["suffix"] == ".docx"
+
+
+def test_create_workspace_document_with_text_content(tmp_path: Path):
+    ws = tmp_path / "agent"
+    gov = ws / "govdocs"
+    gov.mkdir(parents=True)
+
+    detail = create_workspace_document(
+        "govdocs",
+        "note.txt",
+        ws,
+        content_text="hello\nworld",
+    )
+
+    assert (gov / "note.txt").read_text(encoding="utf-8") == "hello\nworld"
+    assert detail["filename"] == "note.txt"
+
+
+def test_create_workspace_document_uses_copy_suffix_when_duplicate(tmp_path: Path):
+    ws = tmp_path / "agent"
+    gov = ws / "govdocs"
+    gov.mkdir(parents=True)
+    (gov / "exists.docx").write_bytes(b"x")
+
+    detail = create_workspace_document("govdocs", "exists.docx", ws)
+
+    assert detail["filename"] == "exists - 副本.docx"
+    assert (gov / "exists - 副本.docx").is_file()

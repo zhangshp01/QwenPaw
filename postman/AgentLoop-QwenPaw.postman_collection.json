@@ -252,7 +252,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"name\": \"文件夹\",\n  \"parent_id\": null\n}"
+              "raw": "{\n  \"folder_name\": \"目录2\",\n  \"parent_dir\": \"govdocs\"\n}"
             },
             "url": "{{baseUrl}}/api/agentloop/workspace/folders"
           }
@@ -267,7 +267,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"name\": \"未命名\",\n  \"parent_id\": null,\n  \"content_html\": \"<p></p>\",\n  \"content_text\": \"\",\n  \"source\": \"manual\"\n}"
+              "raw": "{\n  \"file_name\": \"测试文档1.docx\",\n  \"parent_dir\": \"govdocs/目录2\",\n  \"content_html\": \"<p></p>\",\n  \"content_text\": \"\",\n  \"source\": \"manual\"\n}"
             },
             "url": "{{baseUrl}}/api/agentloop/workspace/documents"
           }

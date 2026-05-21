@@ -17,10 +17,12 @@ from qwenpaw.app.workspace_paths import (
     govdocs_file_detail,
     build_govdocs_list_response,
     list_govdocs_files,
+    govdocs_path_detail,
     rename_govdocs_file,
     resolve_govdocs_file_path,
     resolve_unique_govdocs_dest,
     resolve_workspace_download_files,
+    resolve_workspace_list_directory,
     resolve_workspace_upload_directory,
     save_upload_to_workspace_directory,
     sort_govdocs_by_modified_time,
@@ -51,6 +53,47 @@ def test_list_govdocs_files_includes_subdirectories_and_folders(tmp_path: Path):
     assert ("directory", "reports") in by_key
     assert ("directory", "2026") in by_key
     assert by_key[("file", "nested.docx")]["relative_path"] == "reports/2026/nested.docx"
+
+
+def test_list_govdocs_files_under_subdirectory(tmp_path: Path):
+    ws = tmp_path / "agent"
+    gov = ws / "govdocs"
+    sub = gov / "reports" / "2026"
+    other = gov / "other"
+    sub.mkdir(parents=True)
+    other.mkdir(parents=True)
+    (sub / "nested.docx").write_bytes(b"nested")
+    (other / "skip.docx").write_bytes(b"skip")
+    (gov / "root.docx").write_bytes(b"root")
+
+    list_root = resolve_workspace_list_directory("govdocs/reports", ws)
+    entries = list_govdocs_files(ws, list_root=list_root)
+    filenames = {e["filename"] for e in entries}
+
+    assert filenames == {"2026", "nested.docx"}
+    assert all("skip.docx" not in e.get("relative_path", "") for e in entries)
+    assert all("root.docx" not in e.get("relative_path", "") for e in entries)
+
+
+def test_resolve_workspace_list_directory_rejects_file(tmp_path: Path):
+    ws = tmp_path / "agent"
+    gov = ws / "govdocs"
+    gov.mkdir(parents=True)
+    target = gov / "single.docx"
+    target.write_bytes(b"x")
+
+    with pytest.raises(HTTPException) as exc_info:
+        resolve_workspace_list_directory(str(target), ws)
+    assert exc_info.value.status_code == 400
+
+
+def test_resolve_workspace_list_directory_missing_path(tmp_path: Path):
+    ws = tmp_path / "agent"
+    ws.mkdir()
+
+    with pytest.raises(HTTPException) as exc_info:
+        resolve_workspace_list_directory("govdocs/missing", ws)
+    assert exc_info.value.status_code == 404
 
 
 def test_filter_govdocs_by_relative_path():
@@ -163,11 +206,33 @@ def test_rename_and_delete_govdocs_file(tmp_path: Path):
     src.write_bytes(b"content")
 
     target = resolve_govdocs_file_path("govdocs/old.docx", ws)
-    new_path = rename_govdocs_file(target, "new.docx")
+    new_path = rename_govdocs_file(target, "new.docx", ws)
     assert new_path.name == "new.docx"
     assert govdocs_file_detail(new_path)["size"] == 7
 
-    delete_govdocs_file(new_path)
+    delete_govdocs_file(new_path, ws)
+    assert not new_path.exists()
+
+
+def test_rename_and_delete_govdocs_directory(tmp_path: Path):
+    ws = tmp_path / "agent"
+    gov = ws / "govdocs"
+    folder = gov / "目录2"
+    nested = folder / "子目录"
+    nested.mkdir(parents=True)
+    (nested / "nested.docx").write_bytes(b"nested")
+
+    target = resolve_govdocs_file_path(str(folder), ws)
+    new_path = rename_govdocs_file(target, "新目录", ws)
+    assert new_path.name == "新目录"
+    assert new_path.is_dir()
+    assert (new_path / "子目录" / "nested.docx").is_file()
+
+    detail = govdocs_path_detail(new_path, ws)
+    assert detail["type"] == "directory"
+    assert detail["filename"] == "新目录"
+
+    delete_govdocs_file(new_path, ws)
     assert not new_path.exists()
 
 
@@ -200,6 +265,32 @@ def test_batch_delete_govdocs_files(tmp_path: Path):
     assert not a.exists()
     assert not b.exists()
     assert result["failed"][0]["path"] == missing
+
+
+def test_batch_delete_govdocs_directory_recursive(tmp_path: Path):
+    ws = tmp_path / "agent"
+    gov = ws / "govdocs"
+    folder = gov / "目录2"
+    nested = folder / "子目录"
+    nested.mkdir(parents=True)
+    child = nested / "child.docx"
+    child.write_bytes(b"child")
+
+    result = delete_govdocs_files_batch(ws, [str(folder)])
+    assert result["deletedCount"] == 1
+    assert result["failedCount"] == 0
+    assert not folder.exists()
+
+
+def test_delete_govdocs_root_rejected(tmp_path: Path):
+    ws = tmp_path / "agent"
+    gov = ws / "govdocs"
+    gov.mkdir(parents=True)
+
+    with pytest.raises(HTTPException) as exc_info:
+        delete_govdocs_file(gov, ws)
+    assert exc_info.value.status_code == 400
+    assert gov.exists()
 
 
 def test_save_upload_to_workspace_directory(tmp_path: Path):
@@ -280,6 +371,7 @@ def test_rename_uses_copy_when_target_exists(tmp_path: Path):
     new_path = rename_govdocs_file(
         resolve_govdocs_file_path("govdocs/source.docx", ws),
         "existing.docx",
+        ws,
     )
     assert new_path.name == "existing - 副本.docx"
     assert src.exists() is False
