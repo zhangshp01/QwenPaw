@@ -96,6 +96,7 @@ class SkillInfo(BaseModel):
     """
 
     name: str
+    title: str = ""
     description: str = ""
     version_text: str = ""
     content: str
@@ -2051,11 +2052,13 @@ def _read_skill_from_dir(skill_dir: Path, source: str) -> SkillInfo | None:
     try:
         content = read_text_file_with_encoding_fallback(skill_md)
         description = ""
+        display_title = ""
         emoji = ""
         post: Any = {}
         try:
             post = frontmatter.loads(content)
             description = str(post.get("description", "") or "")
+            display_title = str(post.get("title", "") or "").strip()
 
             # Extract emoji from metadata.qwenpaw.emoji
             emoji = _extract_emoji_from_metadata(post.get("metadata", {}))
@@ -2073,6 +2076,7 @@ def _read_skill_from_dir(skill_dir: Path, source: str) -> SkillInfo | None:
 
         return SkillInfo(
             name=skill_dir.name,
+            title=display_title,
             description=description,
             version_text=_extract_version(post),
             content=content,

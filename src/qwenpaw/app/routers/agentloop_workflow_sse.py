@@ -64,6 +64,15 @@ _GOV_ORDER_SKILLS: tuple[str, ...] = (
     "gov_document_layout",
 )
 
+_SKILL_IN_PROGRESS_LABELS: dict[str, str] = {
+    "doc_retrieval": "资料检索",
+    "doc-retrieval": "资料检索",
+    "gov_document_writer": "公文写作",
+    "gov-document-writer": "公文写作",
+    "doc_reviewer": "公文审核",
+    "gov_document_layout": "公文排版",
+}
+
 _DOCUMENT_STREAM_TOOLS = document_stream_tool_names()
 
 
@@ -402,6 +411,7 @@ def _build_plan_payload(
 _WORKFLOW_RESULT_KEYS_FROM_ROOT: frozenset[str] = frozenset(
     {
         "document",
+        "revisedDocument",
         "resultList",
         "savePath",
         "items",
@@ -642,7 +652,8 @@ class AgentLoopWorkflowSseTransformer:
             dt = root.get("displayText")
             if isinstance(dt, str) and "已完成：" in dt:
                 return dt.replace("已完成：", "进行中：", 1)
-        return f"进行中：{protocol_skill}"
+        label = _SKILL_IN_PROGRESS_LABELS.get(protocol_skill, protocol_skill)
+        return f"进行中：{label}"
 
     def _format_completed_tool_sse(self, row: dict[str, Any]) -> str:
         """Emit ``content_block_stop``; add ``content_block_start`` if not sent at in_progress."""

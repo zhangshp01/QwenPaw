@@ -2,8 +2,8 @@
 """Formal / gov-style document draft (``gov_document_writer``), layout
 (``gov_document_layout``), and review (``doc_reviewer``) helpers for AgentLoop.
 
-``gov_document_writer`` exposes a small argument list: ``content`` / ``data``,
-optional ``title``, ``file_name``, ``document_type``, ``type``, workspace
+``gov_document_writer`` exposes a small argument list: required ``title``,
+``content`` / ``data``, optional ``file_name``, ``document_type``, ``type``, workspace
 ``file_path`` / ``path`` plus line ranges. Additional body field names
 (``text``, ``body``, ``markdown``, …) are accepted via ``**extra`` and merged
 by the same precedence rules as before.
@@ -14,7 +14,8 @@ responses include a non-null ``savePath`` string as the **pending** output path
 (same naming rule as before: ``govdocs/{stem}-{timestamp}.docx`` unless
 ``savePath`` / ``save_path`` hints an absolute/relative path).
 
-``doc_reviewer`` returns ``normalizedResult`` plus ``resultList``.  Layout
+``doc_reviewer`` returns ``normalizedResult`` (``document`` = 待审原文,
+``revisedDocument`` = 定稿) plus ``resultList``.  Layout
 payloads may include ``recommended`` only (see ``hairuo_gov_layout``).
 """
 
@@ -408,6 +409,34 @@ def _merge_gov_inline_body(
     return ""
 
 
+def _resolve_title_from_tool_locals(_locals: dict[str, Any]) -> str:
+    """Resolve non-empty ``title`` from explicit params / ``**extra`` / nested JSON."""
+    title = str(_locals.get("title") or "").strip()
+    if title:
+        return title
+    extra_raw = _locals.get("extra")
+    if isinstance(extra_raw, dict):
+        t = extra_raw.get("title")
+        if isinstance(t, str) and t.strip():
+            return t.strip()
+    for key in ("data", "content"):
+        raw = _locals.get(key, "")
+        if not isinstance(raw, str):
+            continue
+        s = raw.strip()
+        if not s.startswith("{"):
+            continue
+        try:
+            obj: Any = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            t = obj.get("title")
+            if isinstance(t, str) and t.strip():
+                return t.strip()
+    return ""
+
+
 def _merge_body_from_tool_locals(_locals: dict[str, Any]) -> str:
     """Build merged body from a gov tool's ``locals()`` (``extra`` = ``**extra``)."""
     extra_raw = _locals.get("extra")
@@ -523,7 +552,19 @@ def _doc_reviewer_error(detail: str) -> ToolResponse:
     )
 
 
-def _doc_reviewer_ok(document: str, result_list: list[dict[str, Any]]) -> ToolResponse:
+def _doc_reviewer_ok(
+    original_document: str,
+    result_list: list[dict[str, Any]],
+    *,
+    revised_document: str | None = None,
+) -> ToolResponse:
+    nr: dict[str, Any] = {
+        "document": original_document,
+        "source": _SOURCE_OK,
+    }
+    revised = (revised_document or "").strip()
+    if revised:
+        nr["revisedDocument"] = revised
     return _doc_reviewer_json(
         {
             "skillName": _SKILL_NAME_DOC_REVIEWER_EN,
@@ -532,10 +573,7 @@ def _doc_reviewer_ok(document: str, result_list: list[dict[str, Any]]) -> ToolRe
             "retryable": True,
             "sourceState": _SOURCE_OK,
             "errorDetail": None,
-            "normalizedResult": {
-                "document": document,
-                "source": _SOURCE_OK,
-            },
+            "normalizedResult": nr,
             "resultList": result_list,
         },
     )
@@ -763,8 +801,9 @@ async def doc_reviewer(
     路径解析与同项目读取工作区文件的规则一致——**由本工具内部读取，不必再单独调用其它
     读文件工具**。
 
-    返回值为 JSON：``normalizedResult.document`` 为审核修改后的**全文定稿**；顶层
-    ``resultList`` 列出结构化改动项（字段含 ``reason``、``offsets``、``errorType`` 等）。
+    返回值为 JSON：``normalizedResult.document`` 为**待审核原文**（与送入模型的正文一致）；
+    ``normalizedResult.revisedDocument``（若有）为审核修改后的全文定稿；顶层
+    ``resultList`` 列出相对原文的结构化改动项（字段含 ``reason``、``offsets``、``errorType`` 等）。
     """
     ex = {k: v for k, v in extra.items()}
     prior_body = (
@@ -828,15 +867,27 @@ async def doc_reviewer(
         _normalize_review_item(x) for x in result_list if isinstance(x, dict)
     ]
 
-    out_lines = revised.count("\n") + (1 if revised else 0)
-    document_out = truncate_text_output(
+    draft_lines = draft.count("\n") + (1 if draft else 0)
+    original_out = truncate_text_output(
+        draft,
+        start_line=1,
+        total_lines=draft_lines,
+        max_bytes=max_bytes,
+        file_path="<review-source>",
+    )
+    revised_lines = revised.count("\n") + (1 if revised else 0)
+    revised_out = truncate_text_output(
         revised,
         start_line=1,
-        total_lines=out_lines,
+        total_lines=revised_lines,
         max_bytes=max_bytes,
         file_path="<revised-document>",
     )
-    return _doc_reviewer_ok(document_out, normalized_items)
+    return _doc_reviewer_ok(
+        original_out,
+        normalized_items,
+        revised_document=revised_out,
+    )
 
 
 async def _save_gov_style_docx(
@@ -935,9 +986,9 @@ async def _save_gov_style_docx(
 
 
 async def gov_document_writer(
+    title: str = "",
     content: str = "",
     data: str = "",
-    title: str = "",
     file_name: str = "",
     document_type: str = "",
     type: str = "",  # noqa: A002  # API / model payload uses key "type"
@@ -952,17 +1003,26 @@ async def gov_document_writer(
     Does **not** write ``.docx`` or emit ``savePath``. Returns JSON with
     ``normalizedResult.document`` as plain ``标题 + 正文``.
 
-    Prefer ``content`` or JSON-in-``data``. Other body keys (``text``, ``body``,
-    ``markdown``, ``draft``, …) may be passed as additional keyword arguments;
-    they are merged in the order defined by :data:`_GOV_INLINE_BODY_KEYS`.
+    **Required** non-empty ``title`` (公文标题). Prefer ``content`` or
+    JSON-in-``data``. Other body keys (``text``, ``body``, ``markdown``,
+    ``draft``, …) may be passed as additional keyword arguments; they are merged
+    in the order defined by :data:`_GOV_INLINE_BODY_KEYS`.
     """
-    merged = _merge_body_from_tool_locals(locals())
+    loc = locals()
+    resolved_title = _resolve_title_from_tool_locals(loc)
+    if not resolved_title:
+        return _gov_doc_tool_error(
+            _SKILL_NAME_EN,
+            _DISPLAY_ERR_ZH,
+            "错误：缺少标题。请传入非空 ``title``（公文标题）；``file_name`` 不能替代标题。",
+        )
+    merged = _merge_body_from_tool_locals(loc)
     return await _save_gov_style_docx(
         skill_name_en=_SKILL_NAME_EN,
         display_ok_zh=_DISPLAY_OK_ZH,
         display_err_zh=_DISPLAY_ERR_ZH,
         content=merged,
-        title=title,
+        title=resolved_title,
         file_name=file_name,
         document_type=document_type,
         machine_type=type,

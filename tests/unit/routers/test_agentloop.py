@@ -389,6 +389,31 @@ def test_workflow_transformer_create_plan_and_retrieval():
     assert "[DONE]" in tail
 
 
+def test_tool_use_start_label_maps_gov_skills_to_chinese():
+    assert (
+        AgentLoopWorkflowSseTransformer._tool_use_start_label("doc_retrieval", None)
+        == "进行中：资料检索"
+    )
+    assert (
+        AgentLoopWorkflowSseTransformer._tool_use_start_label(
+            "gov_document_writer",
+            None,
+        )
+        == "进行中：公文写作"
+    )
+    assert (
+        AgentLoopWorkflowSseTransformer._tool_use_start_label("doc_reviewer", None)
+        == "进行中：公文审核"
+    )
+    assert (
+        AgentLoopWorkflowSseTransformer._tool_use_start_label(
+            "gov_document_layout",
+            None,
+        )
+        == "进行中：公文排版"
+    )
+
+
 def test_workflow_tool_emits_tool_use_start_on_in_progress_before_completed():
     """Long-running tools: first in_progress exposes tool_use start; completed only closes."""
     wf = AgentLoopWorkflowSseTransformer()
@@ -429,7 +454,7 @@ def test_workflow_tool_emits_tool_use_start_on_in_progress_before_completed():
         and (x.get("content_block") or {}).get("skillName") == "doc_reviewer"
     ]
     assert len(tu_starts) == 1
-    assert tu_starts[0]["content_block"]["displayText"] == "进行中：doc_reviewer"
+    assert tu_starts[0]["content_block"]["displayText"] == "进行中：公文审核"
     stops = [
         x
         for x in lines

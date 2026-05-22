@@ -280,6 +280,7 @@ def _tool_specific_reminder_lines(tool_name: str) -> str:
         )
     if tool_name == "gov_document_writer":
         return (
+            "**必须**传非空 ``title``（公文标题）及正文 ``content`` / ``data``；"
             "响应仅为 JSON（``normalizedResult.document``）；"
             "**勿**含 ``savePath`` 或调用 write_file 落盘。\n"
         )

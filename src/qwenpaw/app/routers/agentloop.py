@@ -751,7 +751,8 @@ async def agentloop_skills(request: Request) -> AgentLoopResponse:
     descriptors = [
         {
             "key": s.name,
-            "title": s.name.replace("-", " ").title(),
+            "title": (s.title or "").strip()
+            or s.name.replace("-", " ").title(),
             "summary": (s.description or "").strip(),
             "examples": [],
         }

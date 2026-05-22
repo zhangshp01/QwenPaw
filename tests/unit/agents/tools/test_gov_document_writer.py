@@ -248,9 +248,23 @@ def test_parse_document_review_response_invalid_document_key():
         _parse_document_review_response('{"document": ""}')
 
 
+def test_gov_document_writer_requires_title():
+    async def _run():
+        r = await gov_document_writer(content="some body", document_type="通知")
+        p = _json_payload(r)
+        assert p["normalizedResult"] is None
+        assert p["sourceState"] == "error"
+        assert p["retryable"] is True
+        assert "savePath" not in p
+        assert p["skillName"] == "gov-document-writer"
+        assert "title" in (p.get("errorDetail") or "").lower()
+
+    asyncio.run(_run())
+
+
 def test_gov_document_writer_requires_content():
     async def _run():
-        r = await gov_document_writer(content="")
+        r = await gov_document_writer(title="测试标题", content="")
         p = _json_payload(r)
         assert p["normalizedResult"] is None
         assert p["sourceState"] == "error"
@@ -451,7 +465,7 @@ def test_gov_document_writer_step_index_from_task_mapping():
     async def _run():
         set_agent_tool_step_for_running_task(3)
         try:
-            r = await gov_document_writer(content="")
+            r = await gov_document_writer(title="T", content="")
             p = _json_payload(r)
             assert p["stepIndex"] == 3
         finally:
